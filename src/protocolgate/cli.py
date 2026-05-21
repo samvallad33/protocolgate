@@ -32,7 +32,7 @@ def _default_policy_dir() -> Path:
 def validate(
     manifest: Annotated[Path, typer.Argument(help="Path to protocolgate.yaml")],
     engine: Annotated[str, typer.Option(help="Policy engine: builtin or opa")] = "builtin",
-    policy_dir: Annotated[Path, typer.Option(help="OPA policy directory")] = _default_policy_dir(),
+    policy_dir: Annotated[Path | None, typer.Option(help="OPA policy directory")] = None,
     output: Annotated[str, typer.Option("--output", "-o", help="Output format: table, json, or markdown")] = "table",
 ) -> None:
     """Validate a deployment manifest before deploy."""
@@ -42,6 +42,7 @@ def validate(
         if engine == "builtin":
             findings = evaluate_manifest(data)
         elif engine == "opa":
+            policy_dir = policy_dir or _default_policy_dir()
             findings = evaluate_with_opa(data, policy_dir)
         else:
             raise typer.BadParameter("engine must be builtin or opa")

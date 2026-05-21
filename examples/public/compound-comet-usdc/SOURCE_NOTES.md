@@ -2,10 +2,9 @@
 
 This is a ProtocolGate public case-study fixture, not a live-state assertion and not an audit of Compound.
 
-Public repo cloned locally:
+Public repo used while building this fixture:
 
 - Source: `https://github.com/compound-finance/comet`
-- Local path: `.research/repos/comet`
 - Shallow clone HEAD used for this fixture: `ed6ebcd`
 
 Source files used:

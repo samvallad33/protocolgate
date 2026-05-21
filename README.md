@@ -1,6 +1,6 @@
 # ProtocolGate
 
-ProtocolGate is a Smart Contract DevSecOps tool for Web3 control-plane
+ProtocolGate is a deployment-topology policy gate for Web3 control-plane
 security: a declarative manifest plus reusable controls for smart-contract
 deployment topology.
 
@@ -33,11 +33,12 @@ ProtocolGate turns recurring audit findings into reusable policy controls:
 
 ## Quickstart
 
+From a checkout of this repository:
+
 ```bash
 uv run protocolgate validate examples/protocolgate.valid.yaml
 uv run protocolgate validate examples/protocolgate.proposal-intent.yaml
 uv run protocolgate export-input examples/protocolgate.valid.yaml
-uv run protocolgate drift examples/protocolgate.valid.yaml examples/live-state.drift.json
 ```
 
 The invalid manifest is expected to fail and emit machine-readable findings:
@@ -46,7 +47,7 @@ The invalid manifest is expected to fail and emit machine-readable findings:
 uv run protocolgate validate examples/protocolgate.invalid.yaml --output json
 ```
 
-Generate a buyer-readable control-plane report:
+Generate an audit-reviewable control-plane report:
 
 ```bash
 uv run protocolgate validate examples/protocolgate.invalid.yaml --output markdown
@@ -55,7 +56,14 @@ uv run protocolgate validate examples/protocolgate.invalid.yaml --output markdow
 See `docs/SAMPLE_CONTROL_PLANE_REPORT.md` for an example report generated from
 the intentionally unsafe manifest.
 
-Use the experimental OPA/Rego pack when `opa` is installed:
+The drift example is also expected to fail because the live-state snapshot
+intentionally disagrees with the manifest:
+
+```bash
+uv run protocolgate drift examples/protocolgate.valid.yaml examples/live-state.drift.json --output json
+```
+
+Use the experimental OPA/Rego subset when `opa` is installed:
 
 ```bash
 uv run protocolgate validate examples/protocolgate.invalid.yaml --engine opa --policy-dir policies
@@ -123,7 +131,8 @@ For this repository:
 As a composite action from this repo:
 
 ```yaml
-- uses: <owner>/<repo>/action@main
+- uses: actions/checkout@v4
+- uses: samvallad33/protocolgate/action@main
   with:
     manifest: protocolgate.yaml
 ```

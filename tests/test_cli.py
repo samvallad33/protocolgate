@@ -87,6 +87,13 @@ def test_validate_with_local_opa_engine(monkeypatch: pytest.MonkeyPatch) -> None
     assert {"CG032", "CG033", "CG034", "CG035", "CG036", "CG037", "CG038"} <= rule_ids
 
 
+def test_validate_help_does_not_expose_local_checkout_path() -> None:
+    result = runner.invoke(app, ["validate", "--help"])
+
+    assert result.exit_code == 0
+    assert str(ROOT) not in result.output
+
+
 def test_drift_json_output_is_machine_readable() -> None:
     result = runner.invoke(
         app,

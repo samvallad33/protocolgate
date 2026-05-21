@@ -2,10 +2,9 @@
 
 This is a ProtocolGate public case-study fixture, not a live-state assertion and not an audit of Aave.
 
-Public repo cloned locally:
+Public repo used while building this fixture:
 
 - Source: `https://github.com/aave-dao/aave-governance-v3`
-- Local path: `.research/repos/aave-governance-v3`
 - Shallow clone HEAD used for this fixture: `5b240b1`
 
 Source files used:

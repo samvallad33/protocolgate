@@ -7,7 +7,7 @@ inputs:
     required: false
     default: protocolgate.yaml
   engine:
-    description: Policy engine to use: builtin or opa.
+    description: "Policy engine to use: builtin or opa."
     required: false
     default: builtin
 

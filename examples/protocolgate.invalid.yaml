@@ -1,0 +1,103 @@
+version: 1
+
+project:
+  name: FragileProtocol
+
+deployment:
+  environment: production
+  chain: ethereum-mainnet
+
+multisigs:
+  - name: TeamMultisig
+    threshold: 1
+    signers:
+      - "0x1000000000000000000000000000000000000011"
+      - "0x1000000000000000000000000000000000000012"
+
+timelocks:
+  - name: ShortTimelock
+    delay_seconds: 3600
+    proposer: TeamMultisig
+    executor: TeamMultisig
+
+tokens:
+  - name: USDC
+    decimals: 6
+
+oracles:
+  - name: ETHUSD
+    decimals: 8
+    max_staleness_seconds: 21600
+    failure_mode: continue
+
+treasury:
+  splits:
+    - recipient: Team
+      bps: 9000
+
+proposal_intent:
+  require_metadata: true
+  max_validity_seconds: 86400
+  require_calldata_hash_match: true
+  require_simulation: true
+  privileged_selectors:
+    - "upgradeTo(address)"
+    - "changeAdmin(address)"
+  allowed_safe_modules:
+    - DelayModule
+  safe_modules:
+    - name: RawExecutionModule
+      address: "0x6000000000000000000000000000000000000006"
+      purpose: "Bypass normal signer review flow."
+  monitor_required_for:
+    - upgrade
+    - oracle_change
+    - bridge_limit_change
+    - mint_cap_change
+    - withdrawal_limit_change
+  proposals:
+    - id: "PG-BAD-001"
+      target: FragileVault
+      category: upgrade
+      selector: "upgradeToAndCall(address,bytes)"
+      created_at: "2026-05-03T00:00:00Z"
+      expires_at: "2026-05-06T00:00:00Z"
+      reviewed_calldata_hash: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      execution_calldata_hash: "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      simulation:
+        provider: tenderly
+        status: failed
+      monitor:
+        enabled: false
+
+contracts:
+  - name: FragileVault
+    type: vault
+    upgradeable: true
+    proxy:
+      kind: transparent
+      admin: "0x9999999999999999999999999999999999999999"
+    roles:
+      admin: "0x9999999999999999999999999999999999999999"
+      pauser: "0x9999999999999999999999999999999999999999"
+    upgrade_safety:
+      storage_layout_check: false
+      initializer_locked: false
+    integrations:
+      - ref: USDC
+        decimals: 18
+    functions:
+      - name: redeem
+        category: redemption
+        external_calls: true
+      - name: unpause
+        admin_only: true
+      - name: setFeeBps
+        category: fee
+        admin_only: true
+      - name: mintRewards
+        category: supply
+        admin_only: true
+  - name: FragileBridge
+    type: bridge
+    upgradeable: false

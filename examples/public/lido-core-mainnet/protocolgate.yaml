@@ -1,0 +1,144 @@
+version: 1
+
+project:
+  name: Lido Core Mainnet
+  category: Public Web3 control-plane fixture
+  source_repo: lidofinance/core
+  source_commit: eb4ff80
+  scope_note: "Modeled case-study manifest from public repo deployment files; Aragon voting/execution is represented as a delayed governance control path."
+
+deployment:
+  environment: production
+  chain: ethereum-mainnet
+  chain_id: 1
+  allowed_deployers:
+    - LidoDAOExecution
+
+governors:
+  - name: LidoAragonVoting
+    address: "0x2e59A20f205bB85a89C53f1936454680651E618e"
+    kind: aragon-voting
+    voting_delay_seconds: 86400
+    voting_period_seconds: 259200
+    timelock: LidoDAOExecution
+
+timelocks:
+  - name: LidoDAOExecution
+    address: "0x3e40D73EB977Dc6a537aF587D48316feE66E9C8c"
+    delay_seconds: 259200
+    proposer: LidoAragonVoting
+    executor: LidoAragonVoting
+
+guardians:
+  - name: LidoGateSeal
+    address: "0x8Ea83AD72396f1E0cD2f8E72b1461db8Eb6aF7B5"
+    powers: []
+
+tokens:
+  - name: stETH
+    address: "0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84"
+    decimals: 18
+  - name: wstETH
+    address: "0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0"
+    decimals: 18
+
+oracles:
+  - name: LidoAccountingOracle
+    address: "0x852deD011285fe67063a08005c71a85690503Cee"
+    decimals: 18
+    max_staleness_seconds: 3600
+    failure_mode: fail_closed
+
+proposal_intent:
+  require_metadata: true
+  max_validity_seconds: 86400
+  require_calldata_hash_match: true
+  require_simulation: true
+  privileged_selectors:
+    - "newAppProxy(bytes32,address,bytes,bool)"
+    - "setApp(bytes32,bytes32,address)"
+    - "resume()"
+  monitor_required_for:
+    - upgrade
+    - admin_transfer
+  proposals:
+    - id: "LIDO-CORE-UPGRADE-REPRESENTATIVE"
+      target: LidoCoreProxy
+      category: upgrade
+      selector: "setApp(bytes32,bytes32,address)"
+      intent: "Representative fixture for an Aragon-governed Lido app upgrade."
+      created_at: "2026-05-03T00:00:00Z"
+      expires_at: "2026-05-04T00:00:00Z"
+      reviewed_calldata_hash: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      execution_calldata_hash: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      simulation:
+        provider: local-fork
+        status: passed
+      monitor:
+        enabled: true
+        provider: protocolgate-fixture
+
+contracts:
+  - name: LidoCoreProxy
+    type: aragon-app-proxy
+    address: "0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84"
+    upgradeable: true
+    proxy:
+      kind: aragon-app
+      admin: LidoDAOExecution
+    roles:
+      admin: LidoDAOExecution
+      owner: LidoDAOExecution
+      pauser: LidoGateSeal
+    upgrade_safety:
+      storage_layout_check: true
+      initializer_locked: true
+    integrations:
+      - ref: stETH
+        decimals: 18
+      - ref: LidoAccountingOracle
+        decimals: 18
+    functions:
+      - name: resume
+        category: emergency_control
+        admin_only: true
+        timelock: LidoDAOExecution
+      - name: setApp
+        category: upgrade
+        admin_only: true
+        timelock: LidoDAOExecution
+  - name: LidoWithdrawalQueue
+    type: withdrawal-queue
+    address: "0x889edC2eDab5f40e902b864aD4d7AdE8E412F9B1"
+    upgradeable: true
+    proxy:
+      kind: ossifiable
+      admin: LidoDAOExecution
+    roles:
+      admin: LidoDAOExecution
+      owner: LidoDAOExecution
+      pauser: LidoGateSeal
+    upgrade_safety:
+      storage_layout_check: true
+      initializer_locked: true
+    functions:
+      - name: resume
+        category: emergency_control
+        admin_only: true
+        timelock: LidoDAOExecution
+  - name: LidoAccountingOracleProxy
+    type: oracle
+    address: "0x852deD011285fe67063a08005c71a85690503Cee"
+    upgradeable: true
+    proxy:
+      kind: ossifiable
+      admin: LidoDAOExecution
+    roles:
+      admin: LidoDAOExecution
+      owner: LidoDAOExecution
+    upgrade_safety:
+      storage_layout_check: true
+      initializer_locked: true
+    integrations:
+      - ref: LidoAccountingOracle
+        decimals: 18

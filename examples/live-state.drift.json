@@ -1,0 +1,16 @@
+{
+  "contracts": [
+    {
+      "name": "MonetrixVault",
+      "proxy": {
+        "admin": "CompromisedAdmin"
+      }
+    }
+  ],
+  "multisigs": [
+    {
+      "name": "ProtocolMultisig",
+      "threshold": 2
+    }
+  ]
+}

@@ -1,0 +1,175 @@
+version: 1
+
+project:
+  name: MonetrixProtocol
+  category: Smart Contract DevSecOps reference topology
+
+deployment:
+  environment: production
+  chain: ethereum-mainnet
+  chain_id: 1
+  allowed_deployers:
+    - ProtocolMultisig
+
+multisigs:
+  - name: ProtocolMultisig
+    address: "0x1000000000000000000000000000000000000001"
+    threshold: 3
+    signers:
+      - "0x1000000000000000000000000000000000000011"
+      - "0x1000000000000000000000000000000000000012"
+      - "0x1000000000000000000000000000000000000013"
+      - "0x1000000000000000000000000000000000000014"
+      - "0x1000000000000000000000000000000000000015"
+  - name: SecurityCouncilMultisig
+    address: "0x2000000000000000000000000000000000000002"
+    threshold: 2
+    signers:
+      - "0x2000000000000000000000000000000000000011"
+      - "0x2000000000000000000000000000000000000012"
+      - "0x2000000000000000000000000000000000000013"
+
+timelocks:
+  - name: ProtocolTimelock
+    address: "0x3000000000000000000000000000000000000003"
+    delay_seconds: 172800
+    proposer: ProtocolMultisig
+    executor: ProtocolMultisig
+  - name: EmergencyUnpauseTimelock
+    address: "0x3000000000000000000000000000000000000004"
+    delay_seconds: 86400
+    proposer: SecurityCouncilMultisig
+    executor: ProtocolMultisig
+
+guardians:
+  - name: SecurityCouncil
+    multisig: SecurityCouncilMultisig
+    powers:
+      - pause
+
+tokens:
+  - name: USDC
+    address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+    decimals: 6
+
+oracles:
+  - name: ChainlinkETHUSD
+    address: "0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419"
+    decimals: 8
+    max_staleness_seconds: 3600
+    failure_mode: fail_closed
+
+treasury:
+  splits:
+    - recipient: ProtocolTreasury
+      bps: 7000
+    - recipient: InsuranceFund
+      bps: 2000
+    - recipient: GrantsMultisig
+      bps: 1000
+
+governance:
+  quorum_bps: 500
+  voting_period_seconds: 172800
+
+proposal_intent:
+  require_metadata: true
+  max_validity_seconds: 86400
+  require_calldata_hash_match: true
+  require_simulation: true
+  privileged_selectors:
+    - "upgradeTo(address)"
+    - "upgradeToAndCall(address,bytes)"
+    - "changeAdmin(address)"
+    - "setOracle(address)"
+    - "setBridgeLimit(uint256)"
+    - "mint(address,uint256)"
+    - "setWithdrawalLimit(uint256)"
+  allowed_safe_modules:
+    - DelayModule
+    - RolesModule
+  safe_modules:
+    - name: DelayModule
+      address: "0x6000000000000000000000000000000000000006"
+      purpose: "Require delayed execution for privileged Safe transactions."
+  monitor_required_for:
+    - upgrade
+    - oracle_change
+    - bridge_limit_change
+    - mint_cap_change
+    - withdrawal_limit_change
+  proposals:
+    - id: "PG-001"
+      target: MonetrixVault
+      category: upgrade
+      selector: "upgradeTo(address)"
+      intent: "Upgrade MonetrixVault to audited implementation v1.2.0."
+      created_at: "2026-05-03T00:00:00Z"
+      expires_at: "2026-05-04T00:00:00Z"
+      reviewed_calldata_hash: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      execution_calldata_hash: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      simulation:
+        provider: tenderly
+        status: passed
+      monitor:
+        enabled: true
+        provider: defender
+
+bridges:
+  - name: L2Bridge
+    rate_limits:
+      per_block: 1000000
+      per_day: 25000000
+
+contracts:
+  - name: MonetrixVault
+    type: vault
+    address: "0x4000000000000000000000000000000000000004"
+    upgradeable: true
+    proxy:
+      kind: transparent
+      admin: ProtocolTimelock
+    roles:
+      admin: ProtocolTimelock
+      owner: ProtocolTimelock
+      pauser: SecurityCouncil
+    upgrade_safety:
+      storage_layout_check: true
+      initializer_locked: true
+    integrations:
+      - ref: USDC
+        decimals: 6
+      - ref: ChainlinkETHUSD
+        decimals: 8
+    functions:
+      - name: redeem
+        category: redemption
+        external_calls: true
+        state_updates_before_external_calls: true
+        controls:
+          - cooldown
+          - circuit_breaker
+          - pause
+          - nonReentrant
+      - name: unpause
+        admin_only: true
+        timelock: EmergencyUnpauseTimelock
+      - name: setFeeBps
+        category: fee
+        admin_only: true
+        timelock: ProtocolTimelock
+        max_bps: 100
+      - name: mintRewards
+        category: supply
+        admin_only: true
+        timelock: ProtocolTimelock
+        supply_cap: "1000000000000"
+  - name: MonetrixL2Bridge
+    type: bridge
+    address: "0x5000000000000000000000000000000000000005"
+    upgradeable: false
+    roles:
+      admin: ProtocolTimelock
+    rate_limits:
+      per_block: 1000000
+      per_day: 25000000

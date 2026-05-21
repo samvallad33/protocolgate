@@ -1,0 +1,35 @@
+name: protocolgate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  policy-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Check lockfile
+        run: uv lock --check
+      - name: Run tests
+        run: uv run --locked pytest
+      - name: Build package distributions
+        run: uv build --clear
+      - name: Validate smart-contract deployment manifest through action
+        uses: ./action
+        with:
+          manifest: examples/protocolgate.valid.yaml
+      - name: Assert invalid manifest fails with JSON findings
+        run: |
+          set +e
+          uv run --locked protocolgate validate examples/protocolgate.invalid.yaml --output json > /tmp/protocolgate-findings.json
+          exit_code=$?
+          set -e
+          test "$exit_code" -eq 1
+          python3 -m json.tool /tmp/protocolgate-findings.json >/dev/null

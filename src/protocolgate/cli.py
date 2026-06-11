@@ -8,9 +8,11 @@ import typer
 from rich.console import Console
 
 from protocolgate.drift import compare_snapshot
+from protocolgate.hunt import hunt_manifest
 from protocolgate.manifest import ManifestError, load_manifest, to_opa_input
+from protocolgate.memory import DEFAULT_BASE_URL, VestigeClient, finding_query
 from protocolgate.opa import OpaUnavailable, evaluate_with_opa
-from protocolgate.report import findings_to_json, findings_to_markdown, print_findings
+from protocolgate.report import EvidenceMap, findings_to_json, findings_to_markdown, print_findings
 from protocolgate.rules import evaluate_manifest
 
 
@@ -34,6 +36,21 @@ def validate(
     engine: Annotated[str, typer.Option(help="Policy engine: builtin or opa")] = "builtin",
     policy_dir: Annotated[Path | None, typer.Option(help="OPA policy directory")] = None,
     output: Annotated[str, typer.Option("--output", "-o", help="Output format: table, json, or markdown")] = "table",
+    with_memory: Annotated[
+        bool,
+        typer.Option(
+            "--with-memory",
+            help=(
+                "Attach advisory institutional evidence from a local Vestige memory "
+                "server to each finding. Advisory only: never changes the verdict "
+                "or exit code."
+            ),
+        ),
+    ] = False,
+    memory_url: Annotated[
+        str,
+        typer.Option(help="Base URL of the local Vestige dashboard API"),
+    ] = DEFAULT_BASE_URL,
 ) -> None:
     """Validate a deployment manifest before deploy."""
 
@@ -56,6 +73,35 @@ def validate(
         console.print(f"[red]policy error:[/red] {exc}")
         raise typer.Exit(2) from exc
 
+    evidence = _collect_memory_evidence(findings, memory_url) if with_memory else None
+
+    if output == "json":
+        print(findings_to_json(findings, evidence=evidence))
+    elif output == "markdown":
+        print(findings_to_markdown(findings, target=str(manifest), evidence=evidence))
+    elif output == "table":
+        print_findings(findings, console=console, evidence=evidence)
+    else:
+        raise typer.BadParameter("output must be table, json, or markdown")
+
+    if findings:
+        raise typer.Exit(1)
+
+
+@app.command()
+def hunt(
+    manifest: Annotated[Path, typer.Argument(help="Path to protocolgate.yaml")],
+    output: Annotated[str, typer.Option("--output", "-o", help="Output format: table, json, or markdown")] = "table",
+) -> None:
+    """Find bounty-oriented control-plane invariant mismatch candidates."""
+
+    try:
+        data = load_manifest(manifest)
+        findings = hunt_manifest(data)
+    except ManifestError as exc:
+        console.print(f"[red]manifest error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+
     if output == "json":
         print(findings_to_json(findings))
     elif output == "markdown":
@@ -67,6 +113,28 @@ def validate(
 
     if findings:
         raise typer.Exit(1)
+
+
+def _collect_memory_evidence(findings, memory_url: str) -> EvidenceMap | None:
+    """Query the local memory server per finding. Advisory only; never raises."""
+
+    client = VestigeClient(memory_url)
+    if not client.is_available():
+        console.print(
+            "[yellow]memory:[/yellow] Vestige not reachable at "
+            f"{client.base_url}; continuing without institutional evidence"
+        )
+        return None
+
+    evidence: EvidenceMap = {}
+    for finding in findings:
+        key = (finding.rule_id, finding.path)
+        if key in evidence:
+            continue
+        result = client.query(finding_query(finding.rule_id, finding.message, finding.path))
+        if result.has_evidence:
+            evidence[key] = result
+    return evidence or None
 
 
 @app.command("export-input")

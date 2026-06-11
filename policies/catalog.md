@@ -44,3 +44,17 @@ that show up repeatedly in smart-contract audit findings and protocol reviews.
 | CG036 | Implemented | Safe/Squads modules and guards must be declared and allowlisted. |
 | CG037 | Implemented | High-privilege proposals require transaction simulation before signing. |
 | CG038 | Implemented | Admin-transfer, oracle-change, bridge-limit, mint-cap, and withdrawal-limit proposals require monitor coverage. |
+| CG039 | Implemented (hunt) | Safety-control scope must cover every state component used by the protected predicate. |
+| CG040 | Planned | Replacement safety controls must be at least as broad as removed guards unless explicitly accepted. |
+| CG041 | Planned | User-protection grace windows must block alternate execution paths that consume user funds. |
+| CG042 | Planned | Pause/unpause recovery windows must be modeled as account-affecting when account health is global. |
+| CG043 | Planned | Existing storage variables must not move slots or offsets during upgrades. |
+| CG044 | Planned | Existing storage variable types must not change incompatibly during upgrades. |
+| CG045 | Planned | Removed storage variables require explicit tombstones or rename maps. |
+| CG046 | Planned | New storage variables must append after the old layout tail. |
+| CG047 | Planned | Storage gaps must not be over-consumed. |
+| CG048 | Planned | Upgradeable inheritance chains should preserve storage gaps. |
+| CG049 | Planned | Proxy upgrade targets must have available storage layout artifacts. |
+| CG050 | Planned | Upgrade migration initializers require explicit intent and simulation evidence. |
+| CG051 | Planned | Implementation contracts must not be directly initializable. |
+| CG052 | Planned | UUPS targets must preserve ERC1967/proxiableUUID expectations. |

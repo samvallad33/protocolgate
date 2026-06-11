@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 from rich.console import Console
 from rich.table import Table
+
+if TYPE_CHECKING:
+    from protocolgate.memory import MemoryResult
 
 
 @dataclass(frozen=True)
@@ -17,11 +20,38 @@ class Violation:
     recommendation: str
 
 
-def findings_to_json(findings: Iterable[Violation]) -> str:
-    return json.dumps([asdict(finding) for finding in findings], indent=2)
+EvidenceMap = dict[tuple[str, str], "MemoryResult"]
+"""Advisory memory evidence keyed by (rule_id, path). Never affects verdicts."""
 
 
-def findings_to_markdown(findings: list[Violation], *, target: str = "deployment manifest") -> str:
+def _evidence_for(finding: Violation, evidence: EvidenceMap | None) -> "MemoryResult | None":
+    if not evidence:
+        return None
+    return evidence.get((finding.rule_id, finding.path))
+
+
+def findings_to_json(findings: Iterable[Violation], *, evidence: EvidenceMap | None = None) -> str:
+    payload = []
+    for finding in findings:
+        item: dict = asdict(finding)
+        result = _evidence_for(finding, evidence)
+        if result is not None:
+            item["institutional_evidence"] = {
+                "advisory": True,
+                "confidence": result.confidence,
+                "contradictions": result.contradictions,
+                "memories": [asdict(ev) for ev in result.evidence],
+            }
+        payload.append(item)
+    return json.dumps(payload, indent=2)
+
+
+def findings_to_markdown(
+    findings: list[Violation],
+    *,
+    target: str = "deployment manifest",
+    evidence: EvidenceMap | None = None,
+) -> str:
     title = "# ProtocolGate Control-Plane Report"
     lines = [
         title,
@@ -75,19 +105,53 @@ def findings_to_markdown(findings: list[Violation], *, target: str = "deployment
             + " |"
         )
 
+    evidenced = [
+        (finding, result)
+        for finding in findings
+        if (result := _evidence_for(finding, evidence)) is not None and result.has_evidence
+    ]
+    if evidenced:
+        lines.extend(
+            [
+                "",
+                "## Institutional Evidence (advisory)",
+                "",
+                "Context retrieved from the local Vestige memory layer. Advisory only: "
+                "it never changes a verdict. The deterministic engine above is authoritative.",
+                "",
+            ]
+        )
+        for finding, result in evidenced:
+            lines.append(f"### {finding.rule_id} - `{_md(finding.path)}`")
+            lines.append("")
+            lines.append(f"Retrieval confidence: {result.confidence:.2f}")
+            if result.contradictions:
+                lines.append(f"Contradictions detected in memory: {result.contradictions}")
+            lines.append("")
+            for ev in result.evidence:
+                lines.append(f"- {_md(ev.render_line())}")
+            lines.append("")
+
     lines.extend(
         [
             "",
             "## Scope Note",
             "",
             "ProtocolGate validates declared deployment topology and control-plane invariants. "
-            "It does not replace a full smart-contract audit, formal verification, or runtime monitoring.",
+            "It does not replace a full smart-contract audit, formal verification, or runtime monitoring. "
+            "Institutional evidence, when present, is advisory context from a local memory layer; "
+            "it is never part of the pass/fail decision.",
         ]
     )
     return "\n".join(lines)
 
 
-def print_findings(findings: list[Violation], *, console: Console | None = None) -> None:
+def print_findings(
+    findings: list[Violation],
+    *,
+    console: Console | None = None,
+    evidence: EvidenceMap | None = None,
+) -> None:
     console = console or Console()
     if not findings:
         console.print("[green]PASS[/green] no policy violations")
@@ -116,6 +180,39 @@ def print_findings(findings: list[Violation], *, console: Console | None = None)
         )
 
     console.print(table)
+    _print_evidence(findings, evidence, console)
+
+
+def _print_evidence(
+    findings: list[Violation],
+    evidence: EvidenceMap | None,
+    console: Console,
+) -> None:
+    if not evidence:
+        return
+
+    evidenced = [
+        (finding, result)
+        for finding in findings
+        if (result := _evidence_for(finding, evidence)) is not None and result.has_evidence
+    ]
+    if not evidenced:
+        return
+
+    console.print()
+    console.print("[bold]Institutional Evidence (advisory)[/bold]")
+    console.print(
+        "[dim]Context from the local Vestige memory layer. Advisory only; "
+        "the deterministic verdict above is authoritative.[/dim]"
+    )
+    for finding, result in evidenced:
+        console.print()
+        header = f"[bold]{finding.rule_id}[/bold] [dim]{finding.path}[/dim]  confidence={result.confidence:.2f}"
+        if result.contradictions:
+            header += f"  [yellow]contradictions={result.contradictions}[/yellow]"
+        console.print(header)
+        for ev in result.evidence:
+            console.print(f"  [cyan]>[/cyan] {ev.render_line()}")
 
 
 def _severity_counts(findings: list[Violation]) -> dict[str, int]:

@@ -53,6 +53,14 @@
       "type": "array",
       "items": { "$ref": "#/$defs/oracle" }
     },
+    "predicates": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/predicate" }
+    },
+    "safety_controls": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/safetyControl" }
+    },
     "bridges": {
       "type": "array",
       "items": { "$ref": "#/$defs/bridge" }
@@ -244,6 +252,83 @@
         "safe_module": { "type": "string" },
         "simulation": { "$ref": "#/$defs/proposalSimulation" },
         "monitor": { "$ref": "#/$defs/proposalMonitor" }
+      },
+      "additionalProperties": true
+    },
+    "predicate": {
+      "type": "object",
+      "required": ["name", "scope"],
+      "properties": {
+        "name": { "type": "string" },
+        "scope": {
+          "oneOf": [
+            { "type": "string" },
+            { "$ref": "#/$defs/scope" }
+          ]
+        },
+        "reads": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "authorizes": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "safetyControl": {
+      "type": "object",
+      "required": ["name", "scope", "protects"],
+      "properties": {
+        "name": { "type": "string" },
+        "contract": { "type": "string" },
+        "state_variable": { "type": "string" },
+        "scope": {
+          "oneOf": [
+            { "type": "string" },
+            { "$ref": "#/$defs/scope" }
+          ]
+        },
+        "protects": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/protectedPredicate" }
+        },
+        "bypass_selectors": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "accepted_scope_mismatch": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "protectedPredicate": {
+      "type": "object",
+      "required": ["action", "predicate"],
+      "properties": {
+        "action": { "type": "string" },
+        "predicate": { "type": "string" },
+        "expected_scope": {
+          "oneOf": [
+            { "type": "string" },
+            { "$ref": "#/$defs/scope" }
+          ]
+        },
+        "loss_surface": { "type": "string" },
+        "bypass_selectors": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "accepted_scope_mismatch": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "scope": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "type": "string" },
+        "key": { "type": "string" }
       },
       "additionalProperties": true
     },

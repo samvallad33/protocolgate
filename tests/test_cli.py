@@ -46,6 +46,41 @@ def test_validate_markdown_output_is_buyer_readable() -> None:
     assert "CG001" in result.output
 
 
+def test_hunt_json_output_reports_scope_mismatch() -> None:
+    result = runner.invoke(
+        app,
+        [
+            "hunt",
+            str(ROOT / "examples" / "protocolgate.aave-grace-bypass.yaml"),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    findings = json.loads(result.output)
+    assert findings[0]["rule_id"] == "CG039"
+    assert findings[0]["severity"] == "critical"
+    assert "reserve-scoped" in findings[0]["message"]
+
+
+def test_hunt_markdown_output_is_reportable() -> None:
+    result = runner.invoke(
+        app,
+        [
+            "hunt",
+            str(ROOT / "examples" / "protocolgate.aave-grace-bypass.yaml"),
+            "--output",
+            "markdown",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "# ProtocolGate Control-Plane Report" in result.output
+    assert "CG039" in result.output
+    assert "LiquidationGrace" in result.output
+
+
 def test_validate_with_local_opa_engine(monkeypatch: pytest.MonkeyPatch) -> None:
     opa = ROOT / ".tools" / "opa"
     if not opa.exists():

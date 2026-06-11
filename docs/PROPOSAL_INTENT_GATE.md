@@ -1,5 +1,26 @@
 # Proposal Intent Gate
 
+The Proposal Intent Gate is the part of ProtocolGate that moves the project
+from "deployment topology is safe" into "the privileged action moving through
+that topology is safe to review and sign."
+
+This is one of the sharpest wedges in the project.
+
+Every mature Web3 team eventually faces the same uncomfortable reality:
+multisigs and governance are not just ceremony. They are production control
+planes. A signer can approve a transaction that upgrades a proxy, changes an
+oracle, raises a bridge limit, modifies withdrawal controls, mints supply, or
+hands admin authority to a different actor. If that transaction is hard to read,
+never expires, routes through an unreviewed module, or contains calldata that
+does not match the human summary, the security model depends on trust and
+attention instead of enforceable evidence.
+
+ProtocolGate's answer is direct:
+
+> A privileged proposal should not be signed unless the intent, calldata,
+> authority path, simulation evidence, module boundary, and monitoring coverage
+> are declared and checkable.
+
 ## Status
 
 The Proposal Intent Gate is active in the built-in ProtocolGate policy engine.
@@ -29,6 +50,56 @@ This is different from checking Solidity code. The proposal may call audited
 code, but the transaction can still be dangerous if it upgrades the wrong
 contract, changes an oracle, changes a bridge limit, mints supply, transfers
 admin authority, or uses calldata that does not match what signers reviewed.
+
+## The Failure Mode In Plain English
+
+The classic failure mode looks like this:
+
+1. A team believes a proposal is routine.
+2. Signers see a short description, a UI label, or a message from a trusted
+   teammate.
+3. The raw calldata is not independently bound to the text they reviewed.
+4. The proposal does not expire quickly, so stale approval risk remains.
+5. A Safe/Squads module or guard path can execute outside the expected human
+   signer threshold.
+6. No simulation artifact is attached to show what state changes actually
+   happen.
+7. No monitor is configured for the high-risk state change.
+8. The transaction executes and the protocol's control plane changes in a way
+   that was not fully reviewed.
+
+ProtocolGate does not try to replace the signing wallet, governance UI,
+simulation platform, monitoring stack, or audit firm. It creates the missing
+policy layer that says: "These fields must exist before this proposal should be
+treated as reviewable."
+
+## The Buyer Value
+
+For a protocol team, Proposal Intent Gate creates a pre-signing checklist that
+can be automated:
+
+- signers see the target, category, selector, and intent
+- approvals expire instead of living forever
+- reviewed calldata and execution calldata must match
+- privileged selectors must be known and allowlisted
+- Safe/Squads modules must be declared and reviewed
+- high-privilege actions must have simulation evidence
+- admin/oracle/bridge/supply/withdrawal changes must have monitor coverage
+
+For an auditor, it creates a repeatable way to ask:
+
+- "What exactly are signers approving?"
+- "How do we know this calldata matches the proposal intent?"
+- "Which module can bypass the normal signer flow?"
+- "Is there a simulation artifact?"
+- "Who monitors the resulting admin-state change?"
+
+For a governance delegate, it creates a clearer security boundary:
+
+- proposal text is not enough
+- UI labels are not enough
+- a Safe transaction queue is not enough
+- calldata, expiry, module authority, simulation, and monitoring all matter
 
 ## What It Checks
 
@@ -71,6 +142,82 @@ Default high-privilege selectors include:
 | `CG036` | High | Safe/Squads modules must be declared and allowlisted. |
 | `CG037` | High | Privileged proposals need a passed transaction simulation. |
 | `CG038` | Medium | High-risk admin proposals need monitor coverage. |
+
+## Rule-by-Rule Security Story
+
+### CG032: Signer-Readable Metadata
+
+If a privileged proposal does not clearly state the target, category, selector,
+and intent, then signers are being asked to approve an opaque action. That is not
+a security process; it is a trust process.
+
+ProtocolGate forces the proposal to become readable before approval:
+
+- what contract is targeted
+- what category of action is being executed
+- what function selector is being called
+- what the human-readable intent claims to be
+
+### CG033: Bounded Validity
+
+Privileged approvals should not live indefinitely. A proposal that made sense
+last week may be dangerous after a code change, governance change, market event,
+or signer rotation.
+
+ProtocolGate requires creation and expiry timestamps and checks the validity
+window against policy.
+
+### CG034: Calldata Hash Binding
+
+This is the most direct signer-safety control.
+
+If the reviewed calldata hash and execution calldata hash differ, the signer
+review process is broken. The proposal that people reviewed is not the payload
+that will execute.
+
+ProtocolGate treats that as critical because it breaks the link between human
+intent and machine execution.
+
+### CG035: Selector Allowlist
+
+Privileged selectors are not normal calls. Functions like `upgradeTo`,
+`changeAdmin`, `setOracle`, `setBridgeLimit`, `mint`, `pause`, and `unpause`
+can change the safety envelope of the protocol.
+
+ProtocolGate requires high-risk selectors to be declared instead of discovered
+after the fact.
+
+### CG036: Safe/Squads Module Allowlist
+
+Modules and guards are part of the security boundary. If a module can execute
+transactions outside the normal signer flow, then it deserves the same level of
+review as signer thresholds and owners.
+
+ProtocolGate requires modules to be declared and allowlisted so hidden execution
+paths are not treated as harmless configuration.
+
+### CG037: Transaction Simulation
+
+High-privilege proposals should be simulated before signatures are collected.
+Simulation is not a proof of safety, but it is useful evidence: state changes,
+logs, token movements, admin changes, and revert paths become visible before the
+proposal reaches production.
+
+ProtocolGate requires the proposal to declare passed simulation evidence when
+policy says simulation is mandatory.
+
+### CG038: Monitor Coverage
+
+Some actions deserve immediate monitoring because they change the control plane:
+
+- admin transfers
+- oracle changes
+- bridge-limit changes
+- mint-cap changes
+- withdrawal-limit changes
+
+ProtocolGate requires monitor coverage for those categories so a high-risk
+change does not execute silently.
 
 ## Manifest Shape
 
@@ -136,6 +283,48 @@ proposal_intent:
 6. CI fails with exit code `1` if any finding exists.
 7. Engineers fix the proposal metadata before signatures are collected.
 
+## Where This Fits In A Real Workflow
+
+The current MVP validates declared proposal metadata. A team can use it like
+this:
+
+1. A privileged action is prepared in a governance or multisig workflow.
+2. The team records the proposal in `protocolgate.yaml` or generates the
+   equivalent manifest entry from an internal process.
+3. The entry includes the target, selector, category, human intent, timestamps,
+   reviewed calldata hash, execution calldata hash, simulation status, module
+   list, and monitor coverage.
+4. CI runs ProtocolGate before the proposal is approved or before deployment
+   artifacts are merged.
+5. Any missing or mismatched evidence becomes a named finding.
+6. The team fixes the proposal package before asking signers to approve.
+
+Future adapters can fetch this evidence directly from Safe, Squads, Snapshot,
+Tally, Defender, Tenderly, RPC, or internal governance tooling. That is roadmap
+work. The current product proves the policy model first.
+
+## What A Strong Proposal Package Looks Like
+
+A high-quality privileged proposal package should include:
+
+- a short title
+- target contract name and address
+- category of action
+- function selector
+- exact calldata hash
+- signer-readable intent
+- reason the action is needed
+- creation time
+- expiry time
+- simulation link or evidence reference
+- module/guard review
+- monitor coverage
+- rollback or incident-response note when relevant
+
+ProtocolGate does not need all of those fields today, but the direction is
+clear: privileged actions should become evidence packages, not blind approval
+requests.
+
 ## Demo Commands
 
 Passing focused Proposal Intent Gate example:
@@ -180,6 +369,26 @@ Shorter version:
 
 > Audits check the code. The Proposal Intent Gate checks whether the privileged
 > transaction moving through governance is safe to sign.
+
+Aggressive version:
+
+> A multisig signature is not a security control if signers cannot prove what
+> they reviewed. Proposal Intent Gate turns privileged approval into a policy
+> artifact: intent, expiry, calldata binding, selector policy, module review,
+> simulation, and monitoring.
+
+Founder version:
+
+> Before your team signs an upgrade, oracle change, bridge limit change, or
+> admin transfer, ProtocolGate checks whether the proposal package is reviewable
+> and bounded. It does not replace your audit or your multisig. It makes the
+> signing process harder to fake, harder to misunderstand, and easier to review.
+
+Auditor version:
+
+> This turns recurring proposal-review assumptions into deterministic findings.
+> Instead of writing "ensure calldata matches intended action" as a manual note,
+> ProtocolGate gives that assumption a rule ID, severity, path, and remediation.
 
 ## What This Is Not
 

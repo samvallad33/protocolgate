@@ -46,6 +46,8 @@ def normalize_manifest(data: Manifest) -> Manifest:
         "bridges",
         "oracles",
         "tokens",
+        "predicates",
+        "safety_controls",
     )
     for key in list_sections:
         value = normalized.get(key, [])
@@ -85,6 +87,27 @@ def normalize_manifest(data: Manifest) -> Manifest:
             if not isinstance(value, dict):
                 raise ManifestError(f"contracts[{contract_index}].{key} must be a mapping")
             contract[key] = value
+
+    for predicate_index, predicate in enumerate(normalized["predicates"]):
+        for key in ("reads", "authorizes"):
+            value = predicate.get(key, [])
+            if value is None:
+                value = []
+            if not isinstance(value, list):
+                raise ManifestError(f"predicates[{predicate_index}].{key} must be a list")
+            predicate[key] = value
+
+    for control_index, control in enumerate(normalized["safety_controls"]):
+        for key in ("protects", "bypass_selectors"):
+            value = control.get(key, [])
+            if value is None:
+                value = []
+            if not isinstance(value, list):
+                raise ManifestError(f"safety_controls[{control_index}].{key} must be a list")
+            for item_index, item in enumerate(value):
+                if key == "protects" and not isinstance(item, dict):
+                    raise ManifestError(f"safety_controls[{control_index}].protects[{item_index}] must be a mapping")
+            control[key] = value
 
     treasury_splits = normalized["treasury"].get("splits", [])
     if treasury_splits is None:

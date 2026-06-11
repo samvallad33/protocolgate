@@ -34,6 +34,8 @@ classifiers = [
   "Topic :: Software Development :: Quality Assurance"
 ]
 dependencies = [
+  "mcp>=1.13.0",
+  "pydantic>=2.11.0",
   "pyyaml>=6.0.2",
   "rich>=13.9.4",
   "typer>=0.15.1"
@@ -41,6 +43,7 @@ dependencies = [
 
 [project.scripts]
 protocolgate = "protocolgate.cli:app"
+protocolgate-mcp = "protocolgate.mcp_server:main"
 
 [dependency-groups]
 dev = [
@@ -62,7 +65,12 @@ include = [
   "/LICENSE",
   "/README.md",
   "/action",
-  "/docs/*.md",
+  "/docs/CONTROL_PLANE_REVIEW_OFFER.md",
+  "/docs/INVARIANT_HUNTER.md",
+  "/docs/KILLER_DEMO_SCRIPT.md",
+  "/docs/PROPOSAL_INTENT_GATE.md",
+  "/docs/PROTOCOLGATE_REVENUE_OS_MCP.md",
+  "/docs/SAMPLE_CONTROL_PLANE_REPORT.md",
   "/examples",
   "/policies",
   "/schema",

@@ -2,6 +2,7 @@ from copy import deepcopy
 from pathlib import Path
 
 from protocolgate.drift import compare_snapshot
+from protocolgate.hunt import hunt_manifest
 from protocolgate.manifest import ManifestError, load_manifest
 from protocolgate.rules import evaluate_manifest
 
@@ -40,6 +41,40 @@ def test_proposal_intent_example_passes() -> None:
     findings = evaluate_manifest(manifest)
 
     assert findings == []
+
+
+def test_hunt_finds_safety_control_scope_mismatch() -> None:
+    manifest = load_manifest(ROOT / "examples" / "protocolgate.aave-grace-bypass.yaml")
+
+    findings = hunt_manifest(manifest)
+    finding = next(item for item in findings if item.rule_id == "CG039")
+
+    assert finding.severity == "critical"
+    assert finding.path == "safety_controls[0].protects[0]"
+    assert "reserve-scoped" in finding.message
+    assert "account-scoped" in finding.message
+    assert "collateralAsset" in finding.message
+    assert "debtAsset" in finding.message
+
+
+def test_validate_does_not_run_hunt_rules() -> None:
+    manifest = load_manifest(ROOT / "examples" / "protocolgate.aave-grace-bypass.yaml")
+
+    findings = evaluate_manifest(manifest)
+    rule_ids = {finding.rule_id for finding in findings}
+
+    assert "CG039" not in rule_ids
+
+
+def test_hunt_allows_explicitly_accepted_scope_mismatch() -> None:
+    manifest = load_manifest(ROOT / "examples" / "protocolgate.aave-grace-bypass.yaml")
+    manifest = deepcopy(manifest)
+    manifest["safety_controls"][0]["protects"][0]["accepted_scope_mismatch"] = True
+
+    findings = hunt_manifest(manifest)
+    rule_ids = {finding.rule_id for finding in findings}
+
+    assert "CG039" not in rule_ids
 
 
 def test_invalid_manifest_reports_proposal_intent_findings() -> None:
@@ -269,6 +304,38 @@ def test_manifest_rejects_bad_proposal_intent_shape(tmp_path: Path) -> None:
         assert "proposal_intent.proposals[0] must be a mapping" in str(exc)
     else:
         raise AssertionError("expected ManifestError")
+
+
+def test_manifest_normalizes_sparse_contract_and_hunt_sections(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "protocolgate.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                "contracts:",
+                "  - name: Sparse",
+                "    type: vault",
+                "predicates:",
+                "  - name: accountHealth",
+                "    scope: account",
+                "safety_controls:",
+                "  - name: LocalGuard",
+                "    scope:",
+                "      kind: reserve",
+                "    protects:",
+                "      - action: act",
+                "        predicate: accountHealth",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    manifest = load_manifest(manifest_path)
+
+    assert manifest["contracts"][0]["functions"] == []
+    assert manifest["contracts"][0]["proxy"] == {}
+    assert manifest["predicates"][0]["reads"] == []
+    assert manifest["safety_controls"][0]["bypass_selectors"] == []
 
 
 def test_drift_snapshot_detects_proxy_admin_and_threshold_changes() -> None:

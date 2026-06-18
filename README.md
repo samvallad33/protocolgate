@@ -204,6 +204,48 @@ guard protecting an account-global health-factor predicate.
 
 See `docs/INVARIANT_HUNTER.md` for the Aave-style scope-mismatch model.
 
+Gate a bounty or audit-contest candidate before writing a report:
+
+```bash
+uv run protocolgate bounty-scope examples/bounty-scope.sample.md \
+  --candidate examples/bounty-candidate.sample.md
+```
+
+The Bounty Scope Gate parses in-scope assets, out-of-scope exclusions,
+trusted-role and centralization exclusions, PoC requirements, reward signals,
+and commit references, then returns `submit`, `defer`, or `kill`.
+
+See `docs/BOUNTY_SCOPE_GATE.md` for the reportability workflow.
+
+### ComposedGraph And Bounty Composition Mode
+
+The ProtocolGate/Vestige integration roadmap is documented in
+`docs/COMPOSED_GRAPH_BOUNTY_MODE.md`.
+
+The first implemented slice is local verdict capsules. `validate`, `hunt`,
+`drift`, and `bounty-scope` can append JSONL records that preserve open doors,
+reportability decisions, closed doors, blockers, live-config assumptions, PoC
+status, and evidence gaps for later memory composition:
+
+```bash
+uv run protocolgate validate examples/protocolgate.invalid.yaml \
+  --capsules .protocolgate/capsules.jsonl
+
+uv run protocolgate hunt examples/protocolgate.aave-grace-bypass.yaml \
+  --capsules .protocolgate/capsules.jsonl
+
+uv run protocolgate drift examples/protocolgate.valid.yaml examples/live-state.drift.json \
+  --capsules .protocolgate/capsules.jsonl
+
+uv run protocolgate bounty-scope examples/bounty-scope.sample.md \
+  --candidate examples/bounty-candidate.sample.md \
+  --capsules .protocolgate/capsules.jsonl
+```
+
+The capsules are advisory and local-only. The current CLI does not yet write
+directly to Vestige, and a never-composed lane is not a finding until source
+review, scope review, and PoC evidence support it.
+
 For the promotion-ready demo talk track, including the 60-second blast script,
 5-minute Loom script, exact commands, and outreach copy, see
 `docs/KILLER_DEMO_SCRIPT.md`.
@@ -227,7 +269,10 @@ The buyer output is not "we found every bug." The output is:
 - `protocolgate.yaml` as the declared authority map
 - audit-style findings for unsafe or missing control-plane assumptions
 - proposal/signing evidence checks
-- bounty-readiness notes for scary-looking exposures
+- bounty-readiness notes that classify scary-looking exposures as `submit`,
+  `defer`, or `kill`
+- verdict capsules and future memory-composition records that preserve what was
+  validated, killed, or left as an evidence gap
 - remediation order for the team
 
 See `docs/CONTROL_PLANE_REVIEW_OFFER.md` for the paid review packages.
@@ -241,8 +286,9 @@ uv run protocolgate-mcp
 ```
 
 It helps score Web3 leads, draft non-spam outreach, forecast bounty-noise
-lanes, prepare founder calls, build mini buyer reports, and log follow-ups.
-It does not scrape LinkedIn or auto-send messages.
+lanes, run the bounty reportability gate, prepare founder calls, build mini
+buyer reports, and log follow-ups. It does not scrape LinkedIn or auto-send
+messages.
 
 See `docs/PROTOCOLGATE_REVENUE_OS_MCP.md`.
 

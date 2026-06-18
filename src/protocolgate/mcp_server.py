@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from enum import Enum
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field
 
+from protocolgate.bounty_scope import analyze_bounty_reportability
 from protocolgate.revenue import (
     PROJECT_ROOT,
     build_offer,
@@ -101,6 +103,24 @@ class TextInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     text: str = Field(..., description="Text to lint or analyze.", min_length=3, max_length=8_000)
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+
+
+class BountyGateInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    scope_text: str = Field(
+        ...,
+        description="Pasted bounty, audit-contest, or Immunefi/Cantina/HackenProof scope text.",
+        min_length=20,
+        max_length=20_000,
+    )
+    candidate_notes: str = Field(
+        default="",
+        description="Candidate finding notes: actor, path, impact, PoC, scope references, and kill checks.",
+        max_length=12_000,
+    )
+    program_name: str = Field(default="", description="Optional program or competition name.")
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
 
 
@@ -339,6 +359,27 @@ async def protocolgate_forecast_bounty_noise(params: HypothesisInput) -> str:
 
 
 @mcp.tool(
+    name="protocolgate_bounty_reportability_gate",
+    annotations={"title": "Bounty Reportability Gate", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+async def protocolgate_bounty_reportability_gate(params: BountyGateInput) -> str:
+    """Parse bounty scope and decide whether a candidate should be submitted.
+
+    This is the anti-noise gate for active hunts. It extracts in-scope and
+    out-of-scope signals, trusted-role and centralization exclusions, PoC
+    requirements, rewards, and commit/version references, then returns
+    submit/defer/kill with missing evidence.
+    """
+
+    result = analyze_bounty_reportability(
+        params.scope_text,
+        candidate_notes=params.candidate_notes,
+        program_name=params.program_name,
+    )
+    return _format(asdict(result), params.response_format)
+
+
+@mcp.tool(
     name="protocolgate_lint_outreach",
     annotations={"title": "Lint ProtocolGate Outreach", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
@@ -451,6 +492,19 @@ def protocolgate_bounty_noise_forecast_prompt() -> str:
         "Use protocolgate_control_plane_hypothesis and protocolgate_forecast_bounty_noise "
         "on the target notes. Separate real exploit-path candidates from scary-looking but "
         "bounded exposures. Then generate a mini report and a non-spam founder DM."
+    )
+
+
+@mcp.prompt("protocolgate_competition_triage")
+def protocolgate_competition_triage_prompt() -> str:
+    """Prompt for running a bounty-scope gate before report writing."""
+
+    return (
+        "Paste the current bounty or audit competition scope into "
+        "protocolgate_bounty_reportability_gate with candidate notes. Do not draft "
+        "a submission until the gate returns submit or the missing evidence list has "
+        "been resolved. Kill trusted-role-only, known-issue, centralization, and "
+        "no-exploit-path candidates quickly."
     )
 
 

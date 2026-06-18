@@ -68,6 +68,8 @@ Then it asks:
   vulnerability claim
 - `protocolgate_forecast_bounty_noise` - likely bounty reports and evidence
   needed
+- `protocolgate_bounty_reportability_gate` - parse bounty/audit-contest scope
+  and classify a candidate as `submit`, `defer`, or `kill`
 - `protocolgate_generate_mini_report` - one-page buyer fit brief
 - `protocolgate_prepare_call` - 15-minute call agenda and close path
 
@@ -90,6 +92,7 @@ Then it asks:
 - `protocolgate_daily_war_room`
 - `protocolgate_founder_close`
 - `protocolgate_bounty_noise_forecast`
+- `protocolgate_competition_triage`
 
 ## Local Storage
 
@@ -118,10 +121,12 @@ without building a full CRM.
 2. Use `protocolgate_signal_queries` to find candidates manually.
 3. Paste notes into `protocolgate_score_lead`.
 4. For A/B leads, run `protocolgate_war_room`.
-5. Lint the draft with `protocolgate_lint_outreach`.
-6. Send manually if the message is specific and accurate.
-7. Log the touch with `protocolgate_log_interaction`.
-8. Use `protocolgate_pipeline_summary` before ending the day.
+5. If there is a bounty or audit-contest scope, paste it into
+   `protocolgate_bounty_reportability_gate` before writing a report.
+6. Lint the draft with `protocolgate_lint_outreach`.
+7. Send manually if the message is specific and accurate.
+8. Log the touch with `protocolgate_log_interaction`.
+9. Use `protocolgate_pipeline_summary` before ending the day.
 
 ## Install
 

@@ -46,6 +46,57 @@ def test_validate_markdown_output_is_buyer_readable() -> None:
     assert "CG001" in result.output
 
 
+def test_validate_capsules_jsonl_preserves_json_and_exit_code(tmp_path: Path) -> None:
+    capsules_path = tmp_path / "capsules.jsonl"
+
+    result = runner.invoke(
+        app,
+        [
+            "validate",
+            str(ROOT / "examples" / "protocolgate.invalid.yaml"),
+            "--output",
+            "json",
+            "--capsules",
+            str(capsules_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    findings = json.loads(result.output)
+    assert findings[0]["rule_id"] == "CG001"
+
+    lines = capsules_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == len(findings)
+    capsule = json.loads(lines[0])
+    assert capsule["source"] == "validate"
+    assert capsule["result"] == "open_door"
+    assert capsule["status"] == "needs_fix_or_review"
+    assert capsule["evidence"]["workflow"] == "validate"
+    assert capsule["evidence"]["poc_status"] == "not_started"
+
+
+def test_validate_capsule_write_failure_preserves_json_and_exit_code(tmp_path: Path) -> None:
+    capsules_path = tmp_path / "capsules-dir"
+    capsules_path.mkdir()
+
+    result = runner.invoke(
+        app,
+        [
+            "validate",
+            str(ROOT / "examples" / "protocolgate.invalid.yaml"),
+            "--output",
+            "json",
+            "--capsules",
+            str(capsules_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    findings = json.loads(result.stdout)
+    assert findings[0]["rule_id"] == "CG001"
+    assert "capsule warning" in result.stderr
+
+
 def test_hunt_json_output_reports_scope_mismatch() -> None:
     result = runner.invoke(
         app,
@@ -62,6 +113,64 @@ def test_hunt_json_output_reports_scope_mismatch() -> None:
     assert findings[0]["rule_id"] == "CG039"
     assert findings[0]["severity"] == "critical"
     assert "reserve-scoped" in findings[0]["message"]
+
+
+def test_hunt_capsules_jsonl_preserves_scope_mismatch_context(tmp_path: Path) -> None:
+    capsules_path = tmp_path / "capsules.jsonl"
+
+    result = runner.invoke(
+        app,
+        [
+            "hunt",
+            str(ROOT / "examples" / "protocolgate.aave-grace-bypass.yaml"),
+            "--output",
+            "json",
+            "--capsules",
+            str(capsules_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    # Existing machine-readable output is not polluted by the capsule writer.
+    findings = json.loads(result.output)
+    assert findings[0]["rule_id"] == "CG039"
+
+    lines = capsules_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    capsule = json.loads(lines[0])
+    assert capsule["schema_version"] == 1
+    assert capsule["source"] == "hunt"
+    assert capsule["result"] == "open_door"
+    assert capsule["status"] == "needs_source_and_poc"
+    assert capsule["lane"] == "global_invariant_local_gate"
+    assert "open-door" in capsule["tags"]
+    assert "boundary-scope" in capsule["tags"]
+    assert capsule["evidence"]["rule_id"] == "CG039"
+    assert capsule["evidence"]["invariant_tested"]["safety_control"] == "LiquidationGrace"
+    assert capsule["evidence"]["invariant_tested"]["predicate"] == "healthFactorBelowOne"
+    assert "source line references" in capsule["missing_evidence"]
+
+
+def test_hunt_capsule_write_failure_preserves_json_and_exit_code(tmp_path: Path) -> None:
+    capsules_path = tmp_path / "capsules-dir"
+    capsules_path.mkdir()
+
+    result = runner.invoke(
+        app,
+        [
+            "hunt",
+            str(ROOT / "examples" / "protocolgate.aave-grace-bypass.yaml"),
+            "--output",
+            "json",
+            "--capsules",
+            str(capsules_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    findings = json.loads(result.stdout)
+    assert findings[0]["rule_id"] == "CG039"
+    assert "capsule warning" in result.stderr
 
 
 def test_hunt_markdown_output_is_reportable() -> None:
@@ -144,6 +253,35 @@ def test_drift_json_output_is_machine_readable() -> None:
     assert result.exit_code == 1
     findings = json.loads(result.output)
     assert findings[0]["message"] == "proxy admin drifted from manifest"
+
+
+def test_drift_capsules_jsonl_preserves_json_and_exit_code(tmp_path: Path) -> None:
+    capsules_path = tmp_path / "capsules.jsonl"
+
+    result = runner.invoke(
+        app,
+        [
+            "drift",
+            str(ROOT / "examples" / "protocolgate.valid.yaml"),
+            str(ROOT / "examples" / "live-state.drift.json"),
+            "--output",
+            "json",
+            "--capsules",
+            str(capsules_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    findings = json.loads(result.output)
+    assert findings[0]["message"] == "proxy admin drifted from manifest"
+
+    lines = capsules_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == len(findings)
+    capsule = json.loads(lines[0])
+    assert capsule["source"] == "drift"
+    assert capsule["lane"] == "runtime_configuration_drift"
+    assert capsule["status"] == "needs_live_config_review"
+    assert capsule["evidence"]["live_config_assumptions"]["requires_live_config"] is True
 
 
 def test_malformed_manifest_returns_clean_error(tmp_path: Path) -> None:

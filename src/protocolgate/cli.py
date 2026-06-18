@@ -7,6 +7,19 @@ from typing import Annotated
 import typer
 from rich.console import Console
 
+from protocolgate.bounty_scope import (
+    analyze_bounty_reportability,
+    bounty_reportability_to_json,
+    bounty_reportability_to_markdown,
+)
+from protocolgate.capsules import (
+    bounty_scope_verdict_capsule,
+    drift_verdict_capsules,
+    hunt_verdict_capsules,
+    text_fingerprint,
+    validate_verdict_capsules,
+    write_capsules_jsonl,
+)
 from protocolgate.drift import compare_snapshot
 from protocolgate.hunt import hunt_manifest
 from protocolgate.manifest import ManifestError, load_manifest, to_opa_input
@@ -21,6 +34,7 @@ app = typer.Typer(
     help="Web3 control-plane policy gate for smart-contract deployment topology.",
 )
 console = Console()
+error_console = Console(stderr=True)
 
 
 def _default_policy_dir() -> Path:
@@ -51,6 +65,16 @@ def validate(
         str,
         typer.Option(help="Base URL of the local Vestige dashboard API"),
     ] = DEFAULT_BASE_URL,
+    capsules: Annotated[
+        Path | None,
+        typer.Option(
+            "--capsules",
+            help=(
+                "Append Bounty Composition Mode verdict capsules as JSONL. "
+                "Advisory only: does not change findings or exit code."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Validate a deployment manifest before deploy."""
 
@@ -84,6 +108,12 @@ def validate(
     else:
         raise typer.BadParameter("output must be table, json, or markdown")
 
+    if capsules is not None:
+        _write_capsules_best_effort(
+            capsules,
+            validate_verdict_capsules(manifest=data, target=str(manifest), findings=findings),
+        )
+
     if findings:
         raise typer.Exit(1)
 
@@ -92,6 +122,16 @@ def validate(
 def hunt(
     manifest: Annotated[Path, typer.Argument(help="Path to protocolgate.yaml")],
     output: Annotated[str, typer.Option("--output", "-o", help="Output format: table, json, or markdown")] = "table",
+    capsules: Annotated[
+        Path | None,
+        typer.Option(
+            "--capsules",
+            help=(
+                "Append Bounty Composition Mode verdict capsules as JSONL. "
+                "Advisory only: does not change findings or exit code."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Find bounty-oriented control-plane invariant mismatch candidates."""
 
@@ -111,8 +151,80 @@ def hunt(
     else:
         raise typer.BadParameter("output must be table, json, or markdown")
 
+    if capsules is not None:
+        _write_capsules_best_effort(
+            capsules,
+            hunt_verdict_capsules(manifest=data, target=str(manifest), findings=findings),
+        )
+
     if findings:
         raise typer.Exit(1)
+
+
+@app.command("bounty-scope")
+def bounty_scope(
+    scope: Annotated[Path, typer.Argument(help="Path to bounty or audit-contest scope text/Markdown")],
+    candidate: Annotated[
+        Path | None,
+        typer.Option("--candidate", "-c", help="Optional candidate finding notes to reportability-gate"),
+    ] = None,
+    program_name: Annotated[str, typer.Option("--program-name", help="Optional program name override")] = "",
+    output: Annotated[str, typer.Option("--output", "-o", help="Output format: markdown or json")] = "markdown",
+    capsules: Annotated[
+        Path | None,
+        typer.Option(
+            "--capsules",
+            help=(
+                "Append Bounty Composition Mode verdict capsules as JSONL. "
+                "Advisory only: does not change the reportability verdict."
+            ),
+        ),
+    ] = None,
+) -> None:
+    """Parse bounty scope and gate a candidate as submit, defer, or kill."""
+
+    try:
+        scope_text = scope.read_text(encoding="utf-8")
+        candidate_text = candidate.read_text(encoding="utf-8") if candidate else ""
+    except OSError as exc:
+        console.print(f"[red]bounty-scope error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+
+    result = analyze_bounty_reportability(
+        scope_text,
+        candidate_notes=candidate_text,
+        program_name=program_name,
+    )
+
+    if output == "json":
+        print(bounty_reportability_to_json(result))
+    elif output == "markdown":
+        print(bounty_reportability_to_markdown(result))
+    else:
+        raise typer.BadParameter("output must be markdown or json")
+
+    if capsules is not None:
+        _write_capsules_best_effort(
+            capsules,
+            (
+                bounty_scope_verdict_capsule(
+                    result=result,
+                    scope_target=str(scope),
+                    candidate_target=str(candidate) if candidate else "",
+                    scope_fingerprint=text_fingerprint(scope_text),
+                    candidate_fingerprint=text_fingerprint(candidate_text) if candidate else "",
+                ),
+            ),
+        )
+
+
+def _write_capsules_best_effort(path: Path, capsules) -> None:
+    """Write local JSONL capsules without changing deterministic verdicts."""
+
+    try:
+        write_capsules_jsonl(path, capsules)
+    except OSError as exc:
+        error_console.print(f"[yellow]capsule warning:[/yellow] {exc}")
 
 
 def _collect_memory_evidence(findings, memory_url: str) -> EvidenceMap | None:
@@ -155,6 +267,16 @@ def drift(
     manifest: Annotated[Path, typer.Argument(help="Path to protocolgate.yaml")],
     snapshot: Annotated[Path, typer.Argument(help="JSON snapshot of live chain state")],
     output: Annotated[str, typer.Option("--output", "-o", help="Output format: table or json")] = "table",
+    capsules: Annotated[
+        Path | None,
+        typer.Option(
+            "--capsules",
+            help=(
+                "Append Bounty Composition Mode verdict capsules as JSONL. "
+                "Advisory only: does not change findings or exit code."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Detect runtime drift against a collected chain-state snapshot."""
 
@@ -179,6 +301,18 @@ def drift(
                 f"[{finding.severity}] {finding.subject}: {finding.message} "
                 f"(expected={finding.expected}, actual={finding.actual})"
             )
+
+    if capsules is not None:
+        _write_capsules_best_effort(
+            capsules,
+            drift_verdict_capsules(
+                manifest=data,
+                target=str(manifest),
+                snapshot_target=str(snapshot),
+                snapshot=live,
+                findings=findings,
+            ),
+        )
 
     if findings:
         raise typer.Exit(1)

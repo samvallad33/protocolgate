@@ -65,6 +65,8 @@ include = [
   "/LICENSE",
   "/README.md",
   "/action",
+  "/docs/BOUNTY_SCOPE_GATE.md",
+  "/docs/COMPOSED_GRAPH_BOUNTY_MODE.md",
   "/docs/CONTROL_PLANE_REVIEW_OFFER.md",
   "/docs/INVARIANT_HUNTER.md",
   "/docs/KILLER_DEMO_SCRIPT.md",

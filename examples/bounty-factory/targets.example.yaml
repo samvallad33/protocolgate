@@ -1,0 +1,61 @@
+# ProtocolGate Bounty-Factory — example targets file
+# =================================================================
+# This file feeds `protocolgate factory <targets.yaml>`. The factory walks each
+# target, collects a live control-plane snapshot over read-only JSON-RPC,
+# consults institutional memory BEFORE doing deep work (so a previously killed
+# lane is skipped, not re-hunted), runs deterministic drift comparison, and maps
+# each target to one of four states:
+#
+#     dead-door | needs-config | needs-PoC | submission-ready
+#
+# BRIGHT LINE: the factory NEVER assigns `submission-ready`. Live drift plus a
+# machine-checkable signal tops out at `needs-PoC` (needs a human source-trace
+# and a real fork PoC). Promotion to submission-ready is a human decision made
+# outside this loop. The factory is read-only: no private keys, no mainnet
+# transactions, fork tests only downstream.
+#
+# Public-repo hygiene: every address below is a PLACEHOLDER or a well-known
+# public deployment address. RPC endpoints are referenced by ENVIRONMENT VARIABLE
+# NAME (rpc_url_env), never as inline secrets. Set them in your shell before
+# running, e.g.:
+#
+#     export ETH_RPC_URL="https://your-eth-node.example/v2/YOUR_KEY"
+#     export BASE_RPC_URL="https://your-base-node.example/v2/YOUR_KEY"
+#
+# Per-row fields:
+#   name         (required)  human label for the target / bounty program
+#   manifest     (required)  path to the protocolgate.yaml that declares the
+#                            EXPECTED control-plane topology for this protocol
+#   chain        (optional)  chain label, informational
+#   rpc_url      (optional)  direct RPC URL — leave unset; prefer rpc_url_env
+#   rpc_url_env  (optional)  NAME of the env var holding the RPC URL (read with
+#                            os.environ.get; a direct rpc_url, if set, wins)
+#   payout       (optional)  max bounty / scope payout, for prioritization
+#   scope_notes  (optional)  free-text scope reminders surfaced alongside results
+
+targets:
+  # --------------------------------------------------------------------------- #
+  # Target 1 — full EVM protocol: upgradeable (EIP-1967) proxy + Safe multisig.
+  # Points at a public case-study manifest already in this repo. The factory
+  # reads each contract's EIP-1967 admin slot and each Safe's getThreshold(),
+  # then drifts those against the declared admin/threshold in the manifest.
+  # --------------------------------------------------------------------------- #
+  - name: Aave Governance V3 (Ethereum) — Bounty Factory
+    chain: ethereum-mainnet
+    manifest: examples/public/aave-governance-v3-ethereum/protocolgate.yaml
+    rpc_url_env: ETH_RPC_URL
+    payout: 1000000          # placeholder ceiling for prioritization only
+    scope_notes: >-
+      Control-plane drift only: proxy-admin redirection on governed contracts
+      and Safe threshold / signer-policy drift. Out of scope for this factory
+      lane: trusted-role abuse, centralization risk, and any finding requiring a
+      privileged signer. needs-PoC lanes still require a human source-trace and
+      a real fork PoC before any submission. Addresses are public/placeholder.
+
+  # --------------------------------------------------------------------------- #
+  # Target 2 — minimal target: only the two required fields (name + manifest)
+  # plus an RPC env var. No payout/scope_notes. Shows the smallest valid row.
+  # --------------------------------------------------------------------------- #
+  - name: Compound III Comet USDC — Bounty Factory (minimal)
+    manifest: examples/public/compound-comet-usdc/protocolgate.yaml
+    rpc_url_env: ETH_RPC_URL

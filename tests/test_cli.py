@@ -284,6 +284,80 @@ def test_drift_capsules_jsonl_preserves_json_and_exit_code(tmp_path: Path) -> No
     assert capsule["evidence"]["live_config_assumptions"]["requires_live_config"] is True
 
 
+def test_bounty_sim_json_output_creates_private_artifacts(tmp_path: Path) -> None:
+    out = tmp_path / "sim"
+
+    result = runner.invoke(
+        app,
+        [
+            "bounty-sim",
+            str(ROOT / "examples" / "protocolgate.valid.yaml"),
+            str(ROOT / "examples" / "live-state.drift.json"),
+            "--out",
+            str(out),
+            "--no-run-foundry",
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["target_name"] == "MonetrixProtocol"
+    assert payload["verdict"] == "open_door_needs_foundry_run"
+    assert payload["foundry"]["status"] == "skipped"
+    assert payload["vestige"]["status"] == "skipped"
+    assert payload["lanes"][0]["template"] == "proxy_admin_drift"
+
+    assert (out / "BOUNTY_SIMULATION_REPORT.md").exists()
+    assert (out / "summary.json").exists()
+    assert (out / "verdict-capsules.jsonl").exists()
+    assert (out / "foundry" / "foundry.toml").exists()
+    assert (out / "foundry" / "test" / "ProtocolGateBountySimulation.t.sol").exists()
+
+    capsule = json.loads((out / "verdict-capsules.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert capsule["workflow"] == "drift"
+    assert capsule["lane"] == "runtime_configuration_drift"
+
+
+def test_bounty_sim_clean_snapshot_exits_zero(tmp_path: Path) -> None:
+    clean_snapshot = tmp_path / "clean.json"
+    clean_snapshot.write_text(
+        json.dumps(
+            {
+                "contracts": [
+                    {"name": "MonetrixVault", "proxy": {"admin": "ProtocolTimelock"}},
+                    {"name": "MonetrixL2Bridge"},
+                ],
+                "multisigs": [
+                    {"name": "ProtocolMultisig", "threshold": 3},
+                    {"name": "SecurityCouncilMultisig", "threshold": 2},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "bounty-sim",
+            str(ROOT / "examples" / "protocolgate.valid.yaml"),
+            str(clean_snapshot),
+            "--out",
+            str(tmp_path / "sim"),
+            "--no-run-foundry",
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["verdict"] == "pass_no_runtime_drift"
+    assert payload["findings"] == []
+
+
 def test_malformed_manifest_returns_clean_error(tmp_path: Path) -> None:
     manifest_path = tmp_path / "protocolgate.yaml"
     manifest_path.write_text("version: 1\ncontracts: [bad]\n", encoding="utf-8")

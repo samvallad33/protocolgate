@@ -25,12 +25,19 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import subprocess
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol
 
 import yaml
 
+from protocolgate.bounty_sim import smart_ingest_stdio
+from protocolgate.capsules import (
+    VerdictCapsule,
+    drift_verdict_capsules,
+)
 from protocolgate.collector import (
     CollectionResult,
     CollectorError,
@@ -91,6 +98,14 @@ RpcResolver = Callable[["FactoryTarget"], str]
 # inject a fake that returns a canned ``ForkPoCResult`` without forge/ityfuzz or
 # network. CORE-1: this gates ELIGIBILITY only -- it NEVER promotes a lane state.
 ForkPoCVerifier = Callable[..., ForkPoCResult]
+# MOAT write-back sink. Given the verdict capsules a finished factory run
+# produced, persist them so future runs compound (dead-doors skip faster,
+# prior-win value-weighting strengthens). The default sink ships them through the
+# SAME stdio ``smart_ingest`` transport bounty-sim uses; tests inject a recorder
+# that captures the capsules WITHOUT any subprocess or network. A writer must
+# NEVER raise into the loop and NEVER set a submission-ready status (it only
+# records what the deterministic verdict already decided).
+VestigeWriter = Callable[[tuple["VerdictCapsule", ...]], None]
 
 
 def _empty_economics_snapshot() -> EconomicsSnapshot:
@@ -209,6 +224,7 @@ def run_factory(
     targets_path: str | Path,
     *,
     write_vestige: bool = False,
+    vestige_writer: VestigeWriter | None = None,
     rpc_resolver: RpcResolver | None = None,
     collect: CollectSnapshotFn = collect_snapshot,
     vestige_client: VestigeQueryClient | None = None,
@@ -230,10 +246,21 @@ def run_factory(
     targets_path:
         Path to the ``targets.yaml`` file.
     write_vestige:
-        Reserved for the eventual write-back of factory capsules. The factory
-        never writes during read-back; this flag is threaded through so callers
-        and tests can assert the read/write split. (Read-back is always on when
-        a Vestige client is available.)
+        When ``True``, the MOAT write-back is enabled: after each target is
+        classified, the factory dual-writes verdict capsules back to Vestige so
+        future runs compound -- dead-door capsules for skipped/no-drift lanes
+        (future runs skip them before scan spend), and budget/realized-impact
+        capsules for live lanes (PRIOR_WIN value-weighting strengthens). Writing
+        happens AFTER read-back and state mapping; it never changes this run's
+        verdict and never sets submission-ready. When ``False`` (default) the
+        factory only READS, exactly as before. Degrades gracefully: a missing or
+        failing writer is a no-op, never fatal.
+    vestige_writer:
+        Optional sink for the write-back capsules. Defaults to
+        :func:`default_vestige_writer`, which ships them through the same stdio
+        ``smart_ingest`` transport bounty-sim uses. Tests inject a recorder that
+        captures the capsules with no subprocess or network. Ignored when
+        ``write_vestige`` is ``False``.
     rpc_resolver:
         Optional callable that turns a :class:`FactoryTarget` into an RPC URL.
         Defaults to :func:`default_rpc_resolver`, which reads a direct
@@ -254,6 +281,13 @@ def run_factory(
     client = vestige_client if vestige_client is not None else VestigeClient()
     solodit = solodit_client if solodit_client is not None else _default_solodit_client()
     history = historical_db if historical_db is not None else _default_historical_db()
+    # MOAT write-back sink. Only resolved when the caller opted in; otherwise the
+    # factory stays read-only and the writer is never touched.
+    writer = (
+        (vestige_writer if vestige_writer is not None else default_vestige_writer)
+        if write_vestige
+        else None
+    )
 
     # One health check for the whole run: if memory is down, every target's
     # read-back degrades to "not queried" without per-target connection storms.
@@ -284,6 +318,7 @@ def run_factory(
                 solodit_client=solodit,
                 historical_db=history,
                 base_scan_cost=base_scan_cost,
+                vestige_writer=writer,
             )
         except ManifestError as exc:
             errors.append(f"{target.name}: manifest error: {exc}")
@@ -345,6 +380,7 @@ def _run_target(
     solodit_client: SoloditClient | None = None,
     historical_db: HistoricalDB | None = None,
     base_scan_cost: float = 1.0,
+    vestige_writer: VestigeWriter | None = None,
 ) -> TargetResult:
     """Collect, read-back, drift-compare, and map one target to a state."""
 
@@ -442,9 +478,25 @@ def _run_target(
         )
 
     state = _target_state(lanes)
-    economics = _economics_for_lanes(lanes)
+    economics = _economics_for_lanes(lanes, readbacks)
     budget_decisions = order_targets(
         lane.budget_decision for lane in lanes if lane.budget_decision is not None
+    )
+
+    # (g) MOAT write-back. The data moat only fills if a run COMPOUNDS: dual-write
+    # dead-door capsules (so future runs skip these lanes before scan spend) and
+    # live budget/realized-impact capsules (so PRIOR_WIN value-weighting grows).
+    # This runs AFTER the deterministic verdict is fixed; it records what already
+    # happened and never sets submission-ready. Never fatal: a writer failure is
+    # swallowed (advisory layer).
+    _write_back_factory_run(
+        target=target,
+        manifest=manifest,
+        snapshot=snapshot,
+        findings=findings,
+        lanes=lanes,
+        readbacks=readbacks,
+        writer=vestige_writer,
     )
 
     return TargetResult(
@@ -802,10 +854,31 @@ def _target_state(lanes: tuple[LaneResult, ...]) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def _economics_for_lanes(lanes: tuple[LaneResult, ...]) -> EconomicsSnapshot:
-    """Record the router economics for the drift lanes this target produced."""
+def _economics_for_lanes(
+    lanes: tuple[LaneResult, ...],
+    readbacks: tuple[LaneReadback, ...] = (),
+) -> EconomicsSnapshot:
+    """Record the router economics for one target.
+
+    Two sources feed the ledger:
+
+    1. ``lanes`` -- the drift-derived lanes (a lane only exists when the engine
+       flagged real drift). A scanned lane records spend; a read-back-killed
+       drift lane records a skip.
+    2. ``readbacks`` -- the FULL prospective set, including dead-door lanes that
+       produced NO live drift. Those never become a ``LaneResult``, so without
+       this second pass their read-back SKIP -- the highest-value skip, since we
+       avoided a lane we already knew was dead -- would be dropped from
+       ``compute_saved``.
+
+    Double-counting is avoided by recording the drift lanes FIRST (which writes
+    their signatures into the ledger's scanned/skipped sets) and then crediting a
+    read-back SKIP only for a signature not already represented by any lane. The
+    ledger's per-signature de-dup makes the skip credit idempotent.
+    """
 
     ledger = ScanLedger()
+    lane_signatures = {lane.signature for lane in lanes}
     for lane in lanes:
         decision = lane.budget_decision
         if decision is not None:
@@ -821,6 +894,17 @@ def _economics_for_lanes(lanes: tuple[LaneResult, ...]) -> EconomicsSnapshot:
             ledger.record_scan(lane.signature)
             if lane.poc_proven:
                 ledger.record_finding(lane.signature, lane.poc_usd_impact)
+
+    # Credit read-back SKIP decisions for dead-door prospective lanes that
+    # produced no live drift (so they never became a LaneResult above). A
+    # no-drift PROCEED read-back is neither scanned nor skipped -- there was
+    # simply nothing to flag -- so only SKIP decisions are counted.
+    for readback in readbacks:
+        if readback.signature in lane_signatures:
+            continue
+        decision = readback.budget_decision
+        if decision is not None and decision.is_skip:
+            ledger.record_skip(readback.signature)
     return ledger.snapshot()
 
 
@@ -836,6 +920,317 @@ def _merge_economics(snapshots: Iterable[EconomicsSnapshot]) -> EconomicsSnapsho
         realized_usd_impact=sum(snapshot.realized_usd_impact for snapshot in rows),
     )
     return ledger.snapshot()
+
+
+# --------------------------------------------------------------------------- #
+# MOAT write-back: a finished run COMPOUNDS into memory (GAP 1)
+# --------------------------------------------------------------------------- #
+
+
+def _write_back_factory_run(
+    *,
+    target: FactoryTarget,
+    manifest: dict[str, Any],
+    snapshot: dict[str, Any],
+    findings: tuple[DriftFinding, ...] | list[DriftFinding],
+    lanes: tuple[LaneResult, ...],
+    readbacks: tuple[LaneReadback, ...],
+    writer: VestigeWriter | None,
+) -> tuple[VerdictCapsule, ...]:
+    """Build and persist the capsules one factory run produced. Never fatal.
+
+    Returns the capsules it built (also handy for tests) regardless of whether a
+    writer is wired. When ``writer`` is ``None`` (read-only run) it builds nothing
+    and returns ``()`` -- the read/write split stays clean. A writer exception is
+    swallowed: the advisory moat must never break the deterministic loop.
+    """
+
+    if writer is None:
+        return ()
+
+    capsules = _factory_capsules(
+        target=target,
+        manifest=manifest,
+        snapshot=snapshot,
+        findings=tuple(findings),
+        lanes=lanes,
+        readbacks=readbacks,
+    )
+    if not capsules:
+        return ()
+    try:
+        writer(capsules)
+    except Exception:  # noqa: BLE001 - write-back is advisory; never fatal
+        pass
+    return capsules
+
+
+def _factory_capsules(
+    *,
+    target: FactoryTarget,
+    manifest: dict[str, Any],
+    snapshot: dict[str, Any],
+    findings: tuple[DriftFinding, ...],
+    lanes: tuple[LaneResult, ...],
+    readbacks: tuple[LaneReadback, ...],
+) -> tuple[VerdictCapsule, ...]:
+    """Dual-write capsule set for one classified target.
+
+    (a) dead-door capsules for every read-back-killed prospective lane (including
+        no-drift dead-door lanes that never became a ``LaneResult``) so future
+        runs skip them before scan spend;
+    (b) live drift capsules (reusing :func:`drift_verdict_capsules`) enriched with
+        the lane's budget decision and any proven realized USD impact, so
+        PRIOR_WIN value-weighting compounds run over run.
+
+    The deterministic verdict is already fixed when this runs; nothing here ever
+    produces a submission-ready signal.
+    """
+
+    capsules: list[VerdictCapsule] = []
+
+    # (a) Dead-door capsules. A prospective lane is dead either because read-back
+    # recalled a prior dead-door (``recalled_dead_door``) or because the router
+    # decided SKIP. Build one capsule per dead signature, de-duplicated.
+    seen_dead: set[str] = set()
+    lane_by_signature = {lane.signature: lane for lane in lanes}
+    for readback in readbacks:
+        decision = readback.budget_decision
+        is_skip = bool(decision is not None and decision.is_skip)
+        if not (readback.recalled_dead_door or is_skip):
+            continue
+        if readback.signature in seen_dead:
+            continue
+        seen_dead.add(readback.signature)
+        capsules.append(
+            _dead_door_capsule(
+                target=target,
+                manifest=manifest,
+                subject=readback.subject,
+                kind=readback.kind,
+                signature=readback.signature,
+                evidence_refs=readback.evidence_refs,
+                note=readback.note,
+                budget=decision,
+                produced_live_drift=readback.signature in lane_by_signature,
+            )
+        )
+
+    # (b) Live drift capsules, enriched with budget + realized-impact memory.
+    live_findings = [
+        finding
+        for finding, lane in zip(findings, lanes)
+        if not lane.skipped_dead_door
+    ]
+    if live_findings:
+        drift_capsules = drift_verdict_capsules(
+            manifest=manifest,
+            target=target.manifest,
+            snapshot_target=target.name,
+            snapshot=snapshot,
+            findings=live_findings,
+        )
+        # ``drift_verdict_capsules`` preserves finding order, so zip against the
+        # live lanes (same order) to attach each lane's budget + impact.
+        live_lanes = [lane for lane in lanes if not lane.skipped_dead_door]
+        for capsule, lane in zip(drift_capsules, live_lanes):
+            capsules.append(_enrich_live_capsule(capsule, lane))
+
+    return tuple(capsules)
+
+
+def _dead_door_capsule(
+    *,
+    target: FactoryTarget,
+    manifest: dict[str, Any],
+    subject: str,
+    kind: str,
+    signature: str,
+    evidence_refs: tuple[str, ...],
+    note: str,
+    budget: BudgetDecision | None,
+    produced_live_drift: bool,
+) -> VerdictCapsule:
+    """A closed-door capsule a future run's read-back will recall and skip.
+
+    The summary/tags/reopen_if carry the dead-door markers
+    :data:`DEAD_DOOR_MARKERS` matches, so the next run's
+    ``_is_dead_door_preview`` recognizes it and short-circuits the lane before
+    scan spend. This is negative knowledge: it never promotes anything.
+    """
+
+    target_name = _manifest_name(manifest)
+    rationale = (budget.rationale if budget is not None else "") or note
+    summary = (
+        f"dead-door lane {signature}: skipped before scan spend. "
+        f"{rationale} reopen_if scope or live config changes."
+    )
+    evidence: dict[str, Any] = {
+        "workflow": "factory",
+        "result": "closed_door",
+        "signature": signature,
+        "subject": subject,
+        "kind": kind,
+        "prior_evidence_refs": list(evidence_refs),
+        "produced_live_drift": produced_live_drift,
+        "route_action": budget.action if budget is not None else "",
+        "route_weight": budget.weight if budget is not None else 0.0,
+    }
+    return VerdictCapsule(
+        capsule_id=_factory_capsule_id("factory_dead_door", target.name, signature),
+        schema_version=1,
+        capsule_type="protocolgate.verdict_capsule.v1",
+        created_at=_now_iso(),
+        producer="protocolgate",
+        workflow="factory",
+        source="protocolgate factory write-back",
+        target=target.manifest,
+        target_name=target_name,
+        lane=kind,
+        result="closed_door",
+        status="closed_door",
+        title=f"Dead-door: {subject} {kind}",
+        summary=summary,
+        tags=(
+            "protocolgate",
+            "verdict-capsule",
+            "factory",
+            "dead-door",
+            "closed-door",
+            f"lane-{kind}",
+        ),
+        evidence=evidence,
+        blockers=(),
+        missing_evidence=(),
+        next_actions=(
+            "Skip this lane on future runs unless reopen_if conditions are met.",
+        ),
+        reopen_if=(
+            "scope language changes",
+            "live control-plane config changes for this subject",
+            "a new PoC proves direct in-scope public-actor impact",
+        ),
+        memory={"advisory_read_refs": list(evidence_refs), "write_status": "factory_write_back"},
+        metadata={
+            "advisory": True,
+            "deterministic_verdict_unchanged": True,
+            "submission_ready": False,
+        },
+    )
+
+
+def _enrich_live_capsule(capsule: VerdictCapsule, lane: LaneResult) -> VerdictCapsule:
+    """Attach a live lane's budget decision + realized impact to its capsule.
+
+    The capsule's deterministic verdict is untouched; only ``evidence`` and
+    ``memory`` gain the routing/impact context that lets PRIOR_WIN value-weighting
+    compound. ``submission_ready`` is pinned ``False`` no matter how strong the
+    proven impact is -- the bright line holds in the moat too.
+    """
+
+    decision = lane.budget_decision
+    evidence = dict(capsule.evidence)
+    evidence.update(
+        {
+            "factory_signature": lane.signature,
+            "factory_status": lane.status,
+            "route_action": decision.action if decision is not None else "",
+            "route_weight": decision.weight if decision is not None else 0.0,
+            "route_expected_value": decision.expected_value if decision is not None else 0.0,
+            "poc_proven": lane.poc_proven,
+            "realized_usd_impact": lane.poc_usd_impact,
+            "reasoning_action": lane.reasoning_action,
+        }
+    )
+    memory = dict(capsule.memory)
+    memory["write_status"] = "factory_write_back"
+    if lane.reasoning_refs:
+        memory["advisory_read_refs"] = list(lane.reasoning_refs)
+    metadata = dict(capsule.metadata)
+    metadata["submission_ready"] = False
+    return replace(
+        capsule,
+        source="protocolgate factory write-back",
+        workflow="factory",
+        evidence=evidence,
+        memory=memory,
+        metadata=metadata,
+    )
+
+
+def _factory_capsule_id(*parts: str) -> str:
+    import hashlib
+
+    raw = "\x1f".join(parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def _now_iso() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).replace(microsecond=0).isoformat()
+
+
+def _manifest_name(manifest: dict[str, Any]) -> str:
+    project = manifest.get("project")
+    if isinstance(project, dict) and project.get("name"):
+        return str(project["name"])
+    return "unknown target"
+
+
+def _capsule_to_smart_ingest_item(capsule: VerdictCapsule) -> dict[str, Any]:
+    """Render one capsule as a Vestige ``smart_ingest`` item.
+
+    Mirrors the ``{content, node_type, source, tags}`` shape bounty-sim's
+    ``_vestige_items`` produces so the moat write-back lands in the same memory
+    space and is recallable by the same read-back path.
+    """
+
+    content = (
+        f"ProtocolGate factory {capsule.result}: {capsule.target_name} / {capsule.lane}. "
+        f"{capsule.summary} "
+        f"status={capsule.status}; reopen_if={'; '.join(capsule.reopen_if[:2])}"
+    )
+    return {
+        "content": content,
+        "node_type": "event",
+        "source": "protocolgate factory write-back",
+        "tags": list(dict.fromkeys([*capsule.tags, "factory", "private-protocolgate"])),
+    }
+
+
+def default_vestige_writer(
+    capsules: tuple[VerdictCapsule, ...],
+    *,
+    command: str = "vestige-mcp",
+    timeout_seconds: int = 45,
+) -> None:
+    """Default MOAT sink: ship capsules through the stdio ``smart_ingest`` path.
+
+    Reuses :func:`protocolgate.bounty_sim.smart_ingest_stdio` -- the exact same
+    JSON-RPC transport bounty-sim uses -- so there is one write path, not two.
+    Degrades gracefully end to end: empty capsule set, a missing ``vestige-mcp``
+    binary, a subprocess failure, or a timeout are all silent no-ops. NEVER
+    raises into the loop. Items are capped to stay within one batch.
+    """
+
+    if not capsules:
+        return
+    resolved = shutil.which(command)
+    if resolved is None:
+        return
+    items = [_capsule_to_smart_ingest_item(capsule) for capsule in capsules][:20]
+    if not items:
+        return
+    try:
+        smart_ingest_stdio(
+            items,
+            command=resolved,
+            timeout_seconds=timeout_seconds,
+            client_name="protocolgate-factory",
+        )
+    except (subprocess.SubprocessError, OSError):
+        return
 
 
 def _target_prior_usd(target: FactoryTarget) -> float:

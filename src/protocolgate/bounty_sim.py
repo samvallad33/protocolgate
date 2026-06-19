@@ -454,40 +454,12 @@ def _write_vestige_mcp(
     if not items:
         return VestigeWrite(status="no_items", command=cmd, items=0, response_tail="", error="")
 
-    payload = "\n".join(
-        [
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": {},
-                        "clientInfo": {"name": "protocolgate-bounty-sim", "version": "0.1.0"},
-                    },
-                }
-            ),
-            json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}),
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 2,
-                    "method": "tools/call",
-                    "params": {"name": "smart_ingest", "arguments": {"items": items, "batchMergePolicy": "smart"}},
-                }
-            ),
-            "",
-        ]
-    )
     try:
-        completed = subprocess.run(
-            (resolved,),
-            input=payload,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
+        completed = smart_ingest_stdio(
+            items,
+            command=resolved,
+            timeout_seconds=timeout_seconds,
+            client_name="protocolgate-bounty-sim",
         )
     except subprocess.TimeoutExpired as exc:
         return VestigeWrite(
@@ -507,6 +479,59 @@ def _write_vestige_mcp(
         items=len(items),
         response_tail=response_tail,
         error=error_tail,
+    )
+
+
+def smart_ingest_stdio(
+    items: list[dict[str, Any]],
+    *,
+    command: str,
+    timeout_seconds: int,
+    client_name: str = "protocolgate",
+) -> subprocess.CompletedProcess[str]:
+    """Drive a stdio MCP ``smart_ingest`` call and return the raw completed process.
+
+    This is the single shared transport for every ProtocolGate write-back path
+    (bounty-sim and the factory moat write-back). It builds the three-line
+    JSON-RPC handshake -- ``initialize`` / ``notifications/initialized`` /
+    ``tools/call smart_ingest`` -- and shells out to a resolved ``vestige-mcp``
+    binary. Callers own resolution (``shutil.which``), the enabled/no-op gate,
+    and graceful-degradation policy; this helper only performs the transport.
+    """
+
+    payload = "\n".join(
+        [
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "clientInfo": {"name": client_name, "version": "0.1.0"},
+                    },
+                }
+            ),
+            json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}),
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "smart_ingest", "arguments": {"items": items, "batchMergePolicy": "smart"}},
+                }
+            ),
+            "",
+        ]
+    )
+    return subprocess.run(
+        (command,),
+        input=payload,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
     )
 
 

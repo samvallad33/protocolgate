@@ -29,8 +29,14 @@ from protocolgate.factory import (
 )
 from protocolgate.forkpoc import DeltaAssertion, ForkPoCResult, STATUS_PROVEN_DELTA
 from protocolgate.memory import MemoryEvidence, MemoryResult
-from protocolgate.reasoning import ACTION_ARM_TEMPLATE, INTENT_HISTORICAL_EXPLOIT
-from protocolgate.router import ROUTE_ARM, ROUTE_SKIP
+from protocolgate.connectors.solodit import SoloditClient
+from protocolgate.historical_db import HistoricalDB, HistoricalExploit
+from protocolgate.reasoning import (
+    ACTION_ARM_TEMPLATE,
+    ACTION_FLAG_DUPLICATE,
+    INTENT_HISTORICAL_EXPLOIT,
+)
+from protocolgate.router import ROUTE_ARM, ROUTE_FLAG, ROUTE_SKIP
 
 
 # --------------------------------------------------------------------------- #
@@ -281,6 +287,58 @@ def test_known_dead_door_lane_is_skipped(tmp_path: Path) -> None:
     assert proxy_readback.budget_decision is not None
     assert proxy_readback.budget_decision.action == ROUTE_SKIP
     assert proxy_readback.budget_decision.evidence == ("deadcap0",)
+    assert result.economics.scans_skipped == 1
+    assert result.economics.scans_spent == 0
+    assert result.economics.compute_saved_percent == 100.0
+
+
+def test_no_drift_dead_door_lane_is_credited_as_skip(tmp_path: Path) -> None:
+    """GAP 2: a dead-door prospective lane with NO live drift still counts as a skip.
+
+    The snapshot matches the manifest exactly, so the drift engine emits no
+    finding and no ``LaneResult`` is ever built. Memory recalls the multisig lane
+    as a prior dead-door. The read-back SKIP for that no-drift dead-door lane is
+    the highest-value skip -- we avoided a lane we already knew was dead -- and
+    must be credited to ``scans_skipped`` via the read-back economics pass. The
+    proxy lane (no drift, no dead-door recall -> PROCEED read-back) must NOT be
+    counted as either a scan or a skip.
+    """
+
+    manifest = _write_manifest(tmp_path)
+    targets = _write_targets(tmp_path, manifest)
+
+    # Snapshot matches the manifest exactly: admin == ADMIN, threshold == 3.
+    # compare_snapshot emits zero findings, so there are zero drift lanes.
+    clean = {
+        "block": "0x123",
+        "contracts": [{"name": "Vault", "address": PROXY, "proxy": {"admin": ADMIN}}],
+        "multisigs": [{"name": "Gov", "address": SAFE, "threshold": 3}],
+    }
+    collector = FakeCollector(snapshots={"http://rpc.local": clean})
+
+    # Memory recalls the multisig lane as a prior dead-door (no drift this run).
+    dead_sig = lane_signature("Acme", "Gov", "multisig_threshold_drift")
+    vestige = FakeVestige(available=True, dead_signatures={dead_sig})
+
+    result = run_factory(
+        targets,
+        rpc_resolver=_resolver,
+        collect=collector,
+        vestige_client=vestige,
+    )
+
+    acme = result.results[0]
+    # No live drift -> no lanes at all -> target is dead-door.
+    assert acme.lanes == ()
+    assert acme.state == STATE_DEAD_DOOR
+    # The dead-door read-back SKIP for the no-drift multisig lane is credited.
+    multisig_rb = next(rb for rb in acme.readbacks if rb.kind == "multisig_threshold_drift")
+    assert multisig_rb.recalled_dead_door is True
+    assert multisig_rb.budget_decision is not None
+    assert multisig_rb.budget_decision.action == ROUTE_SKIP
+    # The proxy lane had no drift and no dead-door recall -> PROCEED, not counted.
+    proxy_rb = next(rb for rb in acme.readbacks if rb.kind == "proxy_admin_drift")
+    assert proxy_rb.recalled_dead_door is False
     assert result.economics.scans_skipped == 1
     assert result.economics.scans_spent == 0
     assert result.economics.compute_saved_percent == 100.0
@@ -573,3 +631,275 @@ def test_missing_rpc_is_recorded_as_error(tmp_path: Path) -> None:
     acme = result.results[0]
     assert acme.errors and "no rpc_url" in acme.errors[0]
     assert collector.calls == []  # never attempted collection
+
+
+# --------------------------------------------------------------------------- #
+# GAP 3: the DEFAULT _historical_recall_adapter consumes an injected
+# SoloditClient + in-memory HistoricalDB (no historical_recall_fn override).
+# These pin that recall reaches a live lane's reasoning_refs + budget_decision
+# through the real run_factory -> _read_back_lane -> _historical_recall_adapter
+# -> judge_lane path, with zero network.
+# --------------------------------------------------------------------------- #
+
+
+def _fake_solodit_http_fn(url, data, headers, timeout):
+    """Canned Solodit POST body. No socket is opened; SoloditClient calls this
+    instead of urllib when injected via ``http_fn``. Returns one critical,
+    rare, high-quality proxy-admin finding so it clears the trust floor and the
+    EXPLOIT_MARKERS classifier inside ``judge_lane``."""
+
+    return {
+        "findings": [
+            {
+                "id": "SOLO-1",
+                "title": "Proxy admin takeover",
+                "severity": "critical",
+                "protocol": "Acme",
+                "tags": ["Access Control", "Proxy", "Admin"],
+                "quality": "high",
+                "rarity": "rare",
+                "url": "https://solodit.cyfrin.io/issues/SOLO-1",
+                "summary": "unprotected upgrade drained the proxy via admin",
+            }
+        ]
+    }
+
+
+def _euler_exploit() -> HistoricalExploit:
+    """An in-memory DeFiHackLabs record whose tags overlap a proxy_admin_drift
+    historical-exploit query ("proxy", "admin", "upgrade")."""
+
+    return HistoricalExploit(
+        date="2023-03-13",
+        project="Euler Finance",
+        tag="euler",
+        poc_path="src/test/2023-03/Euler_exp.sol",
+        fork_block=16_818_057,
+        chain="ethereum",
+        tags=("euler", "proxy", "admin", "upgrade", "flashloan"),
+    )
+
+
+def test_default_adapter_consumes_injected_solodit_and_historical_db(tmp_path: Path) -> None:
+    """GAP 3: with NO historical_recall_fn override, the default
+    _historical_recall_adapter must consume the injected SoloditClient AND the
+    injected in-memory HistoricalDB, folding BOTH public-corpus hits into the
+    live lane's reasoning_refs and budget_decision.
+
+    The Solodit fold-in also fires DUPLICATE_RISK (its preview prefix always
+    trips a duplicate marker), so the precedence-resolved action is
+    FLAG_DUPLICATE -- the real behavior, pinned here."""
+
+    manifest = _write_manifest(tmp_path)
+    targets = _write_targets(tmp_path, manifest)
+    snapshot = {
+        "block": "0x123",
+        "contracts": [
+            {"name": "Vault", "address": PROXY, "proxy": {"admin": "0x9999999999999999999999999999999999999999"}}
+        ],
+        "multisigs": [{"name": "Gov", "address": SAFE, "threshold": 3}],
+    }
+    collector = FakeCollector(snapshots={"http://rpc.local": snapshot})
+
+    # Real SoloditClient with an api_key (so it does not short-circuit on the
+    # key-free guard) and an injected http_fn (so no socket is opened).
+    solodit = SoloditClient(api_key="test-key", http_fn=_fake_solodit_http_fn)
+    history = HistoricalDB(exploits=(_euler_exploit(),))
+
+    result = run_factory(
+        targets,
+        rpc_resolver=_resolver,
+        collect=collector,
+        vestige_client=FakeVestige(available=True),  # no dead-door; pure read-back
+        solodit_client=solodit,
+        historical_db=history,
+        # NOTE: historical_recall_fn intentionally NOT passed -> exercises the
+        # default _historical_recall_adapter.
+    )
+
+    lane = result.results[0].lanes[0]
+
+    # Both public-corpus sources reached the lane's reasoning evidence.
+    assert "solodit:SOLO-1" in lane.reasoning_refs
+    assert "defihacklabs:src/test/2023-03/Euler_exp.sol" in lane.reasoning_refs
+
+    # The default adapter's hits drove the budget decision (not a bare PROCEED).
+    assert lane.budget_decision is not None
+    assert lane.budget_decision.action == ROUTE_FLAG
+    assert result.budget_queue[0].action == ROUTE_FLAG
+
+    # Solodit folds into HISTORICAL_EXPLOIT *and* DUPLICATE_RISK; precedence
+    # resolves to FLAG_DUPLICATE. Pin the real resolved action.
+    assert lane.reasoning_action == ACTION_FLAG_DUPLICATE
+
+    # The bright line still holds: never auto-promoted.
+    assert result.results[0].state == STATE_NEEDS_POC
+    assert result.results[0].state != STATE_SUBMISSION_READY
+
+
+def test_default_adapter_historical_db_only_arms_template(tmp_path: Path) -> None:
+    """GAP 3 (isolated HISTORICAL_EXPLOIT path): when only the injected
+    HistoricalDB has a match (the injected SoloditClient is key-free, so it is a
+    guaranteed no-op), the default _historical_recall_adapter still feeds the
+    DeFiHackLabs hit into the lane and the precedence-resolved action is the
+    clean ARM_TEMPLATE -> ROUTE_ARM."""
+
+    manifest = _write_manifest(tmp_path)
+    targets = _write_targets(tmp_path, manifest)
+    snapshot = {
+        "block": "0x123",
+        "contracts": [
+            {"name": "Vault", "address": PROXY, "proxy": {"admin": "0x9999999999999999999999999999999999999999"}}
+        ],
+        "multisigs": [{"name": "Gov", "address": SAFE, "threshold": 3}],
+    }
+    collector = FakeCollector(snapshots={"http://rpc.local": snapshot})
+
+    # Key-free SoloditClient: search() returns [] immediately (no key), no
+    # network, no http_fn needed. Only the HistoricalDB can contribute.
+    solodit = SoloditClient(api_key=None)
+    history = HistoricalDB(exploits=(_euler_exploit(),))
+
+    result = run_factory(
+        targets,
+        rpc_resolver=_resolver,
+        collect=collector,
+        vestige_client=FakeVestige(available=True),
+        solodit_client=solodit,
+        historical_db=history,
+    )
+
+    lane = result.results[0].lanes[0]
+
+    # The DeFiHackLabs match reached the lane; no Solodit ref (key-free no-op).
+    assert lane.reasoning_refs == ("defihacklabs:src/test/2023-03/Euler_exp.sol",)
+    assert lane.reasoning_action == ACTION_ARM_TEMPLATE
+    assert lane.budget_decision is not None
+    assert lane.budget_decision.action == ROUTE_ARM
+    assert result.budget_queue[0].action == ROUTE_ARM
+
+
+# --------------------------------------------------------------------------- #
+# GAP 1: the MOAT write-back. A finished run COMPOUNDS into memory.
+#
+# A finished factory run must dual-write capsules back to Vestige so future runs
+# skip dead lanes and value-weight prior wins. The default writer ships them
+# through the same stdio smart_ingest transport bounty-sim uses; tests inject a
+# recorder so no subprocess or network is touched. The bright line holds: a
+# write-back never produces a submission-ready signal.
+# --------------------------------------------------------------------------- #
+
+
+class RecordingWriter:
+    """Captures the capsules passed to the MOAT write-back. No I/O."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def __call__(self, capsules: tuple) -> None:
+        self.calls.append(capsules)
+
+    @property
+    def captured(self) -> tuple:
+        return self.calls[0] if self.calls else ()
+
+
+def test_write_vestige_false_never_calls_writer(tmp_path: Path) -> None:
+    """Default read-only run: the write-back is inert and the writer is untouched."""
+
+    manifest = _write_manifest(tmp_path)
+    targets = _write_targets(tmp_path, manifest)
+    drifted = {
+        "block": "0x123",
+        "contracts": [
+            {"name": "Vault", "address": PROXY, "proxy": {"admin": "0x9999999999999999999999999999999999999999"}}
+        ],
+        "multisigs": [{"name": "Gov", "address": SAFE, "threshold": 3}],
+    }
+    collector = FakeCollector(snapshots={"http://rpc.local": drifted})
+    writer = RecordingWriter()
+
+    result = run_factory(
+        targets,
+        rpc_resolver=_resolver,
+        collect=collector,
+        vestige_client=FakeVestige(available=True),
+        # write_vestige defaults to False; pass a writer anyway to prove it is
+        # never invoked unless explicitly enabled.
+        vestige_writer=writer,
+    )
+
+    # The run still classifies normally...
+    assert result.results[0].state == STATE_NEEDS_POC
+    # ...but the read/write split holds: nothing was written.
+    assert writer.calls == []
+
+
+def test_write_vestige_true_writes_dead_door_and_live_capsules(tmp_path: Path) -> None:
+    """write_vestige=True dual-writes a dead-door capsule for the read-back-killed
+    multisig lane AND a live capsule for the drifted proxy lane -- and never a
+    submission-ready signal."""
+
+    manifest = _write_manifest(tmp_path)
+    targets = _write_targets(tmp_path, manifest)
+    # Proxy admin drifts (live needs-PoC lane); the multisig lane does not drift.
+    drifted = {
+        "block": "0x123",
+        "contracts": [
+            {"name": "Vault", "address": PROXY, "proxy": {"admin": "0x9999999999999999999999999999999999999999"}}
+        ],
+        "multisigs": [{"name": "Gov", "address": SAFE, "threshold": 3}],
+    }
+    collector = FakeCollector(snapshots={"http://rpc.local": drifted})
+
+    # Memory recalls the (no-drift) multisig lane as a prior dead-door, so a
+    # dead-door capsule must be written for it even though it produced no finding.
+    dead_sig = lane_signature("Acme", "Gov", "multisig_threshold_drift")
+    vestige = FakeVestige(available=True, dead_signatures={dead_sig})
+    writer = RecordingWriter()
+
+    result = run_factory(
+        targets,
+        rpc_resolver=_resolver,
+        collect=collector,
+        vestige_client=vestige,
+        write_vestige=True,
+        vestige_writer=writer,
+    )
+
+    acme = result.results[0]
+    assert acme.state == STATE_NEEDS_POC
+    assert acme.state != STATE_SUBMISSION_READY  # BRIGHT LINE
+
+    # The writer was called exactly once with this target's capsules.
+    assert len(writer.calls) == 1
+    capsules = writer.captured
+    by_result: dict[str, list] = {}
+    for capsule in capsules:
+        by_result.setdefault(capsule.result, []).append(capsule)
+
+    # (a) A dead-door capsule for the read-back-killed multisig lane.
+    dead = by_result.get("closed_door", [])
+    assert len(dead) == 1
+    dead_cap = dead[0]
+    assert dead_cap.lane == "multisig_threshold_drift"
+    assert dead_cap.status == "closed_door"
+    assert "dead-door" in dead_cap.tags
+    # A future run's read-back must recognize this as a dead-door (marker present).
+    assert any(
+        marker in dead_cap.summary.lower() for marker in ("dead-door", "reopen_if")
+    )
+
+    # (b) A live capsule for the drifted proxy lane, enriched with routing memory.
+    live = by_result.get("open_door", [])
+    assert len(live) == 1
+    live_cap = live[0]
+    assert live_cap.workflow == "factory"
+    assert live_cap.evidence.get("factory_signature") == lane_signature(
+        "Acme", "Vault", "proxy_admin_drift"
+    )
+    assert live_cap.evidence.get("route_action")  # budget decision folded in
+
+    # The bright line holds across every written capsule.
+    assert all(c.status != STATE_SUBMISSION_READY for c in capsules)
+    assert all(c.metadata.get("submission_ready") is False for c in capsules)

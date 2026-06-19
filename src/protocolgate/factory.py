@@ -41,6 +41,12 @@ from protocolgate.collector import (
 from protocolgate.drift import DriftFinding, compare_snapshot
 from protocolgate.manifest import ManifestError, load_manifest
 from protocolgate.memory import MemoryResult, VestigeClient
+from protocolgate.reasoning import (
+    ACTION_PROCEED,
+    ACTION_SKIP,
+    LaneJudgment,
+    judge_lane,
+)
 
 # Four factory states. ``submission-ready`` is intentionally present in the type
 # space but is NEVER assigned by this module (see BRIGHT LINE above).
@@ -110,6 +116,7 @@ class LaneReadback:
     recalled_dead_door: bool
     evidence_refs: tuple[str, ...] = ()
     note: str = ""
+    judgment: LaneJudgment | None = None
 
 
 @dataclass(frozen=True)
@@ -126,6 +133,9 @@ class LaneResult:
     status: str
     skipped_dead_door: bool = False
     evidence_refs: tuple[str, ...] = ()
+    reasoning_action: str = ACTION_PROCEED
+    reasoning_refs: tuple[str, ...] = ()
+    reasoning_summary: str = ""
 
 
 @dataclass(frozen=True)
@@ -310,6 +320,9 @@ def _run_target(
     refs_by_signature = {
         rb.signature: rb.evidence_refs for rb in readbacks if rb.recalled_dead_door
     }
+    judgment_by_signature = {
+        rb.signature: rb.judgment for rb in readbacks if rb.judgment is not None
+    }
 
     # (e) Deterministic drift comparison.
     findings = compare_snapshot(manifest, snapshot)
@@ -322,6 +335,7 @@ def _run_target(
             finding,
             dead_signatures=dead_signatures,
             refs_by_signature=refs_by_signature,
+            judgment_by_signature=judgment_by_signature,
         )
         for finding in findings
     )
@@ -411,6 +425,17 @@ def _read_back_lane(
         for evidence in result.evidence
         if _is_dead_door_preview(evidence.preview)
     )
+
+    # MOAT layer: run the full four-intent cross-bounty reasoning on top of the
+    # authoritative dead-door signal. judge_lane is advisory and never raises; it
+    # surfaces PRIORITIZE / ARM_TEMPLATE / FLAG_DUPLICATE context without changing
+    # the dead-door downgrade (recalled_dead_door stays the byte-for-byte signal).
+    judgment: LaneJudgment | None = None
+    try:
+        judgment = judge_lane(target, subject, kind, client)
+    except Exception:  # noqa: BLE001 - advisory layer must never be fatal
+        judgment = None
+
     return LaneReadback(
         subject=subject,
         kind=kind,
@@ -419,6 +444,7 @@ def _read_back_lane(
         recalled_dead_door=bool(dead_refs),
         evidence_refs=dead_refs,
         note="recalled prior dead-door capsule" if dead_refs else "",
+        judgment=judgment,
     )
 
 
@@ -433,11 +459,18 @@ def _lane_from_finding(
     *,
     dead_signatures: set[str],
     refs_by_signature: dict[str, tuple[str, ...]],
+    judgment_by_signature: dict[str, LaneJudgment] | None = None,
 ) -> LaneResult:
     kind = _kind_for_finding(finding)
     signature = lane_signature(target, finding.subject, kind)
     skipped = signature in dead_signatures
     status = STATE_DEAD_DOOR if skipped else _live_lane_status(finding)
+
+    judgment = (judgment_by_signature or {}).get(signature)
+    reasoning_action = judgment.action if judgment is not None else ACTION_PROCEED
+    reasoning_refs = judgment.evidence_refs if judgment is not None else ()
+    reasoning_summary = judgment.summary if judgment is not None else ""
+
     return LaneResult(
         subject=finding.subject,
         kind=kind,
@@ -449,6 +482,9 @@ def _lane_from_finding(
         status=status,
         skipped_dead_door=skipped,
         evidence_refs=refs_by_signature.get(signature, ()),
+        reasoning_action=reasoning_action,
+        reasoning_refs=reasoning_refs,
+        reasoning_summary=reasoning_summary,
     )
 
 

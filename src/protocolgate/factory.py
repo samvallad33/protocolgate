@@ -24,7 +24,7 @@ Design constraints (load-bearing, do not violate):
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -39,6 +39,7 @@ from protocolgate.collector import (
     targets_from_manifest,
 )
 from protocolgate.drift import DriftFinding, compare_snapshot
+from protocolgate.forkpoc import ForkConfig, ForkPoCResult, verify as forkpoc_verify
 from protocolgate.manifest import ManifestError, load_manifest
 from protocolgate.memory import MemoryResult, VestigeClient
 from protocolgate.reasoning import (
@@ -78,6 +79,10 @@ DEAD_DOOR_MARKERS = (
 CollectSnapshotFn = Callable[..., CollectionResult]
 # Resolves a target's ``rpc_url`` / ``rpc_url_env`` declaration into a usable URL.
 RpcResolver = Callable[["FactoryTarget"], str]
+# An injectable fork-PoC verifier matching ``forkpoc.verify``'s shape so tests can
+# inject a fake that returns a canned ``ForkPoCResult`` without forge/ityfuzz or
+# network. CORE-1: this gates ELIGIBILITY only -- it NEVER promotes a lane state.
+ForkPoCVerifier = Callable[..., ForkPoCResult]
 
 
 class VestigeQueryClient(Protocol):
@@ -136,6 +141,12 @@ class LaneResult:
     reasoning_action: str = ACTION_PROCEED
     reasoning_refs: tuple[str, ...] = ()
     reasoning_summary: str = ""
+    # CORE-1 fork-PoC eligibility signal. SURFACED, never load-bearing on state:
+    # ``poc_proven`` True means the lane is ELIGIBLE for a human to promote to
+    # submission-ready, but ``status`` stays capped at needs-PoC. Defaulted so
+    # every existing construction site and test is unaffected.
+    poc_status: str = ""
+    poc_proven: bool = False
 
 
 @dataclass(frozen=True)
@@ -184,6 +195,10 @@ def run_factory(
     vestige_client: VestigeQueryClient | None = None,
     block: str = "latest",
     timeout: float = 15.0,
+    run_poc: bool = False,
+    poc_verifier: ForkPoCVerifier = forkpoc_verify,
+    poc_chain_id: int = 1,
+    poc_timeout: int = 180,
 ) -> FactoryResult:
     """Run the bounty-factory loop over every target in ``targets_path``.
 
@@ -236,6 +251,10 @@ def run_factory(
                 vestige_available=vestige_available,
                 block=block,
                 timeout=timeout,
+                run_poc=run_poc,
+                poc_verifier=poc_verifier,
+                poc_chain_id=poc_chain_id,
+                poc_timeout=poc_timeout,
             )
         except ManifestError as exc:
             errors.append(f"{target.name}: manifest error: {exc}")
@@ -280,6 +299,10 @@ def _run_target(
     vestige_available: bool,
     block: str,
     timeout: float,
+    run_poc: bool = False,
+    poc_verifier: ForkPoCVerifier = forkpoc_verify,
+    poc_chain_id: int = 1,
+    poc_timeout: int = 180,
 ) -> TargetResult:
     """Collect, read-back, drift-compare, and map one target to a state."""
 
@@ -339,6 +362,27 @@ def _run_target(
         )
         for finding in findings
     )
+
+    # CORE-1 (OFF BY DEFAULT): optionally fork-prove live drift lanes. This
+    # ATTACHES an eligibility signal (poc_status / poc_proven) but NEVER mutates
+    # ``status`` -- the bright line means a proven delta makes a lane ELIGIBLE
+    # for a human to promote, not promoted. ``_target_state`` below therefore
+    # still tops out at needs-PoC.
+    if run_poc:
+        lanes = tuple(
+            _maybe_verify_lane(
+                lane,
+                finding,
+                rpc_url=rpc_url,
+                target=target,
+                verifier=poc_verifier,
+                chain_id=poc_chain_id,
+                block=snapshot.get("block", block),
+                timeout=poc_timeout,
+            )
+            for lane, finding in zip(lanes, findings)
+        )
+
     state = _target_state(lanes)
 
     return TargetResult(
@@ -486,6 +530,87 @@ def _lane_from_finding(
         reasoning_refs=reasoning_refs,
         reasoning_summary=reasoning_summary,
     )
+
+
+def _maybe_verify_lane(
+    lane: LaneResult,
+    finding: DriftFinding,
+    *,
+    rpc_url: str,
+    target: FactoryTarget,
+    verifier: ForkPoCVerifier,
+    chain_id: int,
+    block: Any,
+    timeout: int,
+) -> LaneResult:
+    """Fork-prove ONE live drift lane and attach an eligibility signal.
+
+    BRIGHT LINE: this returns a lane whose ``status`` is byte-for-byte the input
+    lane's status. A ``proven_delta`` sets ``poc_proven=True`` (the lane is now
+    ELIGIBLE for a human to promote to submission-ready), but the factory still
+    does NOT promote -- ``status`` stays capped at needs-PoC and the human
+    submits. Only runs for a live ``needs-PoC`` lane with an rpc_url + target
+    address; otherwise the lane is returned unchanged. Never raises: a verifier
+    failure leaves the lane untouched (poc_status='', poc_proven=False).
+    """
+
+    if lane.skipped_dead_door or lane.status != STATE_NEEDS_POC:
+        return lane
+
+    target_address = _lane_target_address(target, finding)
+    if not rpc_url or not target_address:
+        return lane
+
+    fork_block = _fork_block(block)
+    if fork_block is None:
+        return lane
+
+    fork = ForkConfig(rpc_url=rpc_url, block=fork_block, chain_id=chain_id)
+    try:
+        poc: ForkPoCResult = verifier(
+            finding,
+            fork,
+            target_address,
+            run=True,
+            timeout=timeout,
+        )
+    except Exception:  # noqa: BLE001 - PoC layer must never be fatal to the loop
+        return lane
+
+    # ``is_proven`` is the hard constraint: a real, measured before != after.
+    proven = bool(getattr(poc, "is_proven", lambda: False)())
+
+    # SURFACE the signal; DO NOT touch ``status``. The bright line lives here.
+    return replace(lane, poc_status=poc.status, poc_proven=proven)
+
+
+def _lane_target_address(target: FactoryTarget, finding: DriftFinding) -> str:
+    """Best-effort target address for a lane's fork PoC.
+
+    Address resolution is intentionally conservative: only an explicit on-finding
+    address is used. A name-only finding yields "" so we never fork-prove against
+    a guessed address, and the lane is left unproven (degrade gracefully).
+    """
+
+    return getattr(finding, "address", "") or ""
+
+
+def _fork_block(block: Any) -> int | None:
+    """Coerce a snapshot block ('latest' / '0x123' / 291) into an int for the fork.
+
+    ``latest`` (or any unparseable value) returns ``None`` so the PoC is skipped
+    rather than pinned to a meaningless block.
+    """
+
+    if isinstance(block, int):
+        return block
+    text = str(block).strip().lower()
+    if not text or text == "latest":
+        return None
+    try:
+        return int(text, 16) if text.startswith("0x") else int(text)
+    except ValueError:
+        return None
 
 
 def _kind_for_finding(finding: DriftFinding) -> str:

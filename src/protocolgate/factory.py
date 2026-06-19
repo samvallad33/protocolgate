@@ -24,9 +24,10 @@ Design constraints (load-bearing, do not violate):
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 
 import yaml
 
@@ -38,16 +39,23 @@ from protocolgate.collector import (
     collect_snapshot,
     targets_from_manifest,
 )
+from protocolgate.connectors.solodit import SoloditClient, SoloditFinding
 from protocolgate.drift import DriftFinding, compare_snapshot
+from protocolgate.economics import EconomicsSnapshot, ScanLedger
 from protocolgate.forkpoc import ForkConfig, ForkPoCResult, verify as forkpoc_verify
+from protocolgate.historical_db import HistoricalDB, HistoricalExploit
 from protocolgate.manifest import ManifestError, load_manifest
-from protocolgate.memory import MemoryResult, VestigeClient
+from protocolgate.memory import MemoryEvidence, MemoryResult, VestigeClient
 from protocolgate.reasoning import (
     ACTION_PROCEED,
     ACTION_SKIP,
+    INTENT_DUPLICATE_RISK,
+    INTENT_HISTORICAL_EXPLOIT,
+    HistoricalRecallFn,
     LaneJudgment,
     judge_lane,
 )
+from protocolgate.router import BudgetDecision, order_targets, route
 
 # Four factory states. ``submission-ready`` is intentionally present in the type
 # space but is NEVER assigned by this module (see BRIGHT LINE above).
@@ -83,6 +91,10 @@ RpcResolver = Callable[["FactoryTarget"], str]
 # inject a fake that returns a canned ``ForkPoCResult`` without forge/ityfuzz or
 # network. CORE-1: this gates ELIGIBILITY only -- it NEVER promotes a lane state.
 ForkPoCVerifier = Callable[..., ForkPoCResult]
+
+
+def _empty_economics_snapshot() -> EconomicsSnapshot:
+    return ScanLedger().snapshot()
 
 
 class VestigeQueryClient(Protocol):
@@ -122,6 +134,7 @@ class LaneReadback:
     evidence_refs: tuple[str, ...] = ()
     note: str = ""
     judgment: LaneJudgment | None = None
+    budget_decision: BudgetDecision | None = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +160,8 @@ class LaneResult:
     # every existing construction site and test is unaffected.
     poc_status: str = ""
     poc_proven: bool = False
+    poc_usd_impact: float = 0.0
+    budget_decision: BudgetDecision | None = None
 
 
 @dataclass(frozen=True)
@@ -165,6 +180,8 @@ class TargetResult:
     errors: tuple[str, ...]
     vestige_available: bool
     skipped: bool = False
+    economics: EconomicsSnapshot = field(default_factory=_empty_economics_snapshot)
+    budget_decisions: tuple[BudgetDecision, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -176,6 +193,8 @@ class FactoryResult:
     results: tuple[TargetResult, ...]
     vestige_available: bool
     errors: tuple[str, ...] = field(default_factory=tuple)
+    economics: EconomicsSnapshot = field(default_factory=_empty_economics_snapshot)
+    budget_queue: tuple[BudgetDecision, ...] = ()
 
     @property
     def states(self) -> dict[str, str]:
@@ -199,6 +218,10 @@ def run_factory(
     poc_verifier: ForkPoCVerifier = forkpoc_verify,
     poc_chain_id: int = 1,
     poc_timeout: int = 180,
+    historical_recall_fn: HistoricalRecallFn | None = None,
+    solodit_client: SoloditClient | None = None,
+    historical_db: HistoricalDB | None = None,
+    base_scan_cost: float = 1.0,
 ) -> FactoryResult:
     """Run the bounty-factory loop over every target in ``targets_path``.
 
@@ -229,6 +252,8 @@ def run_factory(
     targets = _load_targets(targets_path)
     resolver = rpc_resolver or default_rpc_resolver
     client = vestige_client if vestige_client is not None else VestigeClient()
+    solodit = solodit_client if solodit_client is not None else _default_solodit_client()
+    history = historical_db if historical_db is not None else _default_historical_db()
 
     # One health check for the whole run: if memory is down, every target's
     # read-back degrades to "not queried" without per-target connection storms.
@@ -255,11 +280,22 @@ def run_factory(
                 poc_verifier=poc_verifier,
                 poc_chain_id=poc_chain_id,
                 poc_timeout=poc_timeout,
+                historical_recall_fn=historical_recall_fn,
+                solodit_client=solodit,
+                historical_db=history,
+                base_scan_cost=base_scan_cost,
             )
         except ManifestError as exc:
             errors.append(f"{target.name}: manifest error: {exc}")
             result = _error_target(target, f"manifest error: {exc}", vestige_available)
         results.append(result)
+
+    economics = _merge_economics(result.economics for result in results)
+    budget_queue = order_targets(
+        decision
+        for result in results
+        for decision in result.budget_decisions
+    )
 
     return FactoryResult(
         targets_path=str(targets_path),
@@ -267,6 +303,8 @@ def run_factory(
         results=tuple(results),
         vestige_available=vestige_available,
         errors=tuple(errors),
+        economics=economics,
+        budget_queue=budget_queue,
     )
 
 
@@ -303,6 +341,10 @@ def _run_target(
     poc_verifier: ForkPoCVerifier = forkpoc_verify,
     poc_chain_id: int = 1,
     poc_timeout: int = 180,
+    historical_recall_fn: HistoricalRecallFn | None = None,
+    solodit_client: SoloditClient | None = None,
+    historical_db: HistoricalDB | None = None,
+    base_scan_cost: float = 1.0,
 ) -> TargetResult:
     """Collect, read-back, drift-compare, and map one target to a state."""
 
@@ -336,7 +378,17 @@ def _run_target(
     # prospective drift lane and ask memory whether it is already dead.
     prospective = _prospective_lanes(contracts, multisigs)
     readbacks = tuple(
-        _read_back_lane(target.name, subject, kind, client)
+        _read_back_lane(
+            target.name,
+            subject,
+            kind,
+            client,
+            prior_usd_impact=_target_prior_usd(target),
+            base_scan_cost=base_scan_cost,
+            historical_recall_fn=historical_recall_fn,
+            solodit_client=solodit_client,
+            historical_db=historical_db,
+        )
         for subject, kind in prospective
     )
     dead_signatures = {rb.signature for rb in readbacks if rb.recalled_dead_door}
@@ -345,6 +397,11 @@ def _run_target(
     }
     judgment_by_signature = {
         rb.signature: rb.judgment for rb in readbacks if rb.judgment is not None
+    }
+    budget_by_signature = {
+        rb.signature: rb.budget_decision
+        for rb in readbacks
+        if rb.budget_decision is not None
     }
 
     # (e) Deterministic drift comparison.
@@ -359,6 +416,7 @@ def _run_target(
             dead_signatures=dead_signatures,
             refs_by_signature=refs_by_signature,
             judgment_by_signature=judgment_by_signature,
+            budget_by_signature=budget_by_signature,
         )
         for finding in findings
     )
@@ -384,6 +442,10 @@ def _run_target(
         )
 
     state = _target_state(lanes)
+    economics = _economics_for_lanes(lanes)
+    budget_decisions = order_targets(
+        lane.budget_decision for lane in lanes if lane.budget_decision is not None
+    )
 
     return TargetResult(
         name=target.name,
@@ -397,6 +459,8 @@ def _run_target(
         readbacks=readbacks,
         errors=tuple(errors),
         vestige_available=vestige_available,
+        economics=economics,
+        budget_decisions=budget_decisions,
     )
 
 
@@ -429,11 +493,25 @@ def _read_back_lane(
     subject: str,
     kind: str,
     client: VestigeQueryClient | None,
+    *,
+    prior_usd_impact: float = 0.0,
+    base_scan_cost: float = 1.0,
+    historical_recall_fn: HistoricalRecallFn | None = None,
+    solodit_client: SoloditClient | None = None,
+    historical_db: HistoricalDB | None = None,
 ) -> LaneReadback:
     """Closed-door read-back for one prospective lane. Never raises."""
 
     signature = lane_signature(target, subject, kind)
     if client is None:
+        judgment = LaneJudgment(
+            signature=signature,
+            action=ACTION_PROCEED,
+            confidence_delta=0.0,
+            intents=(),
+            summary=f"{signature}: vestige unavailable; read-back skipped -> PROCEED.",
+            available=False,
+        )
         return LaneReadback(
             subject=subject,
             kind=kind,
@@ -441,11 +519,25 @@ def _read_back_lane(
             queried=False,
             recalled_dead_door=False,
             note="vestige unavailable; read-back skipped",
+            judgment=judgment,
+            budget_decision=route(
+                judgment,
+                prior_usd_impact=prior_usd_impact,
+                base_scan_cost=base_scan_cost,
+            ),
         )
 
     try:
         result = client.query(signature)
     except Exception:  # noqa: BLE001 - advisory layer must never be fatal
+        judgment = LaneJudgment(
+            signature=signature,
+            action=ACTION_PROCEED,
+            confidence_delta=0.0,
+            intents=(),
+            summary=f"{signature}: vestige query failed; read-back skipped -> PROCEED.",
+            available=False,
+        )
         return LaneReadback(
             subject=subject,
             kind=kind,
@@ -453,32 +545,73 @@ def _read_back_lane(
             queried=False,
             recalled_dead_door=False,
             note="vestige query failed; read-back skipped",
+            judgment=judgment,
+            budget_decision=route(
+                judgment,
+                prior_usd_impact=prior_usd_impact,
+                base_scan_cost=base_scan_cost,
+            ),
         )
 
     if not getattr(result, "available", False) or not result.evidence:
-        return LaneReadback(
-            subject=subject,
-            kind=kind,
-            signature=signature,
-            queried=True,
-            recalled_dead_door=False,
+        dead_refs: tuple[str, ...] = ()
+    else:
+        dead_refs = tuple(
+            evidence.memory_id
+            for evidence in result.evidence
+            if _is_dead_door_preview(evidence.preview)
         )
 
-    dead_refs = tuple(
-        evidence.memory_id
-        for evidence in result.evidence
-        if _is_dead_door_preview(evidence.preview)
+    recall_fn = historical_recall_fn or _historical_recall_adapter(
+        solodit_client=solodit_client,
+        historical_db=historical_db,
+        kind=kind,
+        subject=subject,
     )
 
     # MOAT layer: run the full four-intent cross-bounty reasoning on top of the
     # authoritative dead-door signal. judge_lane is advisory and never raises; it
-    # surfaces PRIORITIZE / ARM_TEMPLATE / FLAG_DUPLICATE context without changing
-    # the dead-door downgrade (recalled_dead_door stays the byte-for-byte signal).
+    # surfaces PRIORITIZE / ARM_TEMPLATE / FLAG_DUPLICATE context and feeds the
+    # budget router before any optional fork-PoC spend.
     judgment: LaneJudgment | None = None
     try:
-        judgment = judge_lane(target, subject, kind, client)
+        judgment = judge_lane(
+            target,
+            subject,
+            kind,
+            client,
+            historical_recall_fn=recall_fn,
+        )
     except Exception:  # noqa: BLE001 - advisory layer must never be fatal
         judgment = None
+    if dead_refs:
+        summary = (
+            f"{signature}: direct dead-door read-back [{','.join(ref[:8] for ref in dead_refs[:3])}] "
+            "-> SKIP before scan spend."
+        )
+        judgment = (
+            replace(judgment, action=ACTION_SKIP, summary=summary)
+            if judgment is not None
+            else LaneJudgment(
+                signature=signature,
+                action=ACTION_SKIP,
+                confidence_delta=-1.0,
+                intents=(),
+                summary=summary,
+                available=True,
+            )
+        )
+    budget = (
+        route(
+            judgment,
+            prior_usd_impact=prior_usd_impact,
+            base_scan_cost=base_scan_cost,
+        )
+        if judgment is not None
+        else None
+    )
+    if dead_refs and budget is not None:
+        budget = replace(budget, evidence=dead_refs)
 
     return LaneReadback(
         subject=subject,
@@ -489,6 +622,7 @@ def _read_back_lane(
         evidence_refs=dead_refs,
         note="recalled prior dead-door capsule" if dead_refs else "",
         judgment=judgment,
+        budget_decision=budget,
     )
 
 
@@ -504,10 +638,12 @@ def _lane_from_finding(
     dead_signatures: set[str],
     refs_by_signature: dict[str, tuple[str, ...]],
     judgment_by_signature: dict[str, LaneJudgment] | None = None,
+    budget_by_signature: dict[str, BudgetDecision] | None = None,
 ) -> LaneResult:
     kind = _kind_for_finding(finding)
     signature = lane_signature(target, finding.subject, kind)
-    skipped = signature in dead_signatures
+    budget = (budget_by_signature or {}).get(signature)
+    skipped = signature in dead_signatures or bool(budget and budget.is_skip)
     status = STATE_DEAD_DOOR if skipped else _live_lane_status(finding)
 
     judgment = (judgment_by_signature or {}).get(signature)
@@ -529,6 +665,7 @@ def _lane_from_finding(
         reasoning_action=reasoning_action,
         reasoning_refs=reasoning_refs,
         reasoning_summary=reasoning_summary,
+        budget_decision=budget,
     )
 
 
@@ -579,9 +716,17 @@ def _maybe_verify_lane(
 
     # ``is_proven`` is the hard constraint: a real, measured before != after.
     proven = bool(getattr(poc, "is_proven", lambda: False)())
+    usd_impact = 0.0
+    if proven and poc.delta is not None and poc.delta.usd_impact is not None:
+        usd_impact = max(0.0, float(poc.delta.usd_impact))
 
     # SURFACE the signal; DO NOT touch ``status``. The bright line lives here.
-    return replace(lane, poc_status=poc.status, poc_proven=proven)
+    return replace(
+        lane,
+        poc_status=poc.status,
+        poc_proven=proven,
+        poc_usd_impact=usd_impact,
+    )
 
 
 def _lane_target_address(target: FactoryTarget, finding: DriftFinding) -> str:
@@ -650,6 +795,212 @@ def _target_state(lanes: tuple[LaneResult, ...]) -> str:
     if any(lane.status == STATE_NEEDS_CONFIG for lane in live):
         return STATE_NEEDS_CONFIG
     return STATE_DEAD_DOOR
+
+
+# --------------------------------------------------------------------------- #
+# CORE-0 economics + CORE-2 public-corpus recall helpers
+# --------------------------------------------------------------------------- #
+
+
+def _economics_for_lanes(lanes: tuple[LaneResult, ...]) -> EconomicsSnapshot:
+    """Record the router economics for the drift lanes this target produced."""
+
+    ledger = ScanLedger()
+    for lane in lanes:
+        decision = lane.budget_decision
+        if decision is not None:
+            ledger.record_decision(
+                decision,
+                finding_proven=lane.poc_proven,
+                usd_impact=lane.poc_usd_impact,
+            )
+            continue
+        if lane.skipped_dead_door:
+            ledger.record_skip(lane.signature)
+        else:
+            ledger.record_scan(lane.signature)
+            if lane.poc_proven:
+                ledger.record_finding(lane.signature, lane.poc_usd_impact)
+    return ledger.snapshot()
+
+
+def _merge_economics(snapshots: Iterable[EconomicsSnapshot]) -> EconomicsSnapshot:
+    """Merge per-target snapshots into one run-level economics snapshot."""
+
+    rows = tuple(snapshots)
+    ledger = ScanLedger(
+        scans_spent=sum(snapshot.scans_spent for snapshot in rows),
+        scans_skipped=sum(snapshot.scans_skipped for snapshot in rows),
+        scan_cost_spent=sum(snapshot.scan_cost_spent for snapshot in rows),
+        findings_proven=sum(snapshot.findings_proven for snapshot in rows),
+        realized_usd_impact=sum(snapshot.realized_usd_impact for snapshot in rows),
+    )
+    return ledger.snapshot()
+
+
+def _target_prior_usd(target: FactoryTarget) -> float:
+    """Best-effort payout parser for value-weighted routing.
+
+    ``targets.yaml`` often carries human text like ``50000``, ``$50k`` or
+    ``up to 1.5M``. The router only needs an advisory prior-impact weight, so
+    parsing is intentionally tolerant and falls back to zero.
+    """
+
+    text = str(target.payout or "").replace(",", "")
+    match = re.search(r"(?P<num>\d+(?:\.\d+)?)\s*(?P<suffix>[kKmMbB])?", text)
+    if not match:
+        return 0.0
+    value = float(match.group("num"))
+    suffix = (match.group("suffix") or "").lower()
+    if suffix == "k":
+        value *= 1_000.0
+    elif suffix == "m":
+        value *= 1_000_000.0
+    elif suffix == "b":
+        value *= 1_000_000_000.0
+    return max(0.0, value)
+
+
+def _default_solodit_client() -> SoloditClient:
+    """Construct the optional Solodit connector from env, degrading key-free."""
+
+    api_key = (
+        os.environ.get("PROTOCOLGATE_SOLODIT_API_KEY")
+        or os.environ.get("SOLODIT_API_KEY")
+        or os.environ.get("CYFRIN_API_KEY")
+    )
+    return SoloditClient(api_key=api_key)
+
+
+def _default_historical_db() -> HistoricalDB:
+    """Load an optional local DeFiHackLabs README/corpus path from env."""
+
+    path = (
+        os.environ.get("PROTOCOLGATE_DEFIHACKLABS_README")
+        or os.environ.get("DEFIHACKLABS_README")
+        or os.environ.get("DEFIHACKLABS_PATH")
+    )
+    return HistoricalDB.load(path)
+
+
+def _historical_recall_adapter(
+    *,
+    solodit_client: SoloditClient | None,
+    historical_db: HistoricalDB | None,
+    kind: str,
+    subject: str,
+) -> HistoricalRecallFn:
+    """Build the public-corpus recall function consumed by ``judge_lane``."""
+
+    def recall(intent: str, query: str) -> tuple[MemoryEvidence, ...]:
+        evidence: list[MemoryEvidence] = []
+        if solodit_client is not None and intent in (
+            INTENT_HISTORICAL_EXPLOIT,
+            INTENT_DUPLICATE_RISK,
+        ):
+            evidence.extend(
+                _solodit_evidence(
+                    solodit_client.search_drift(
+                        kind,
+                        keywords=f"{subject} {query}",
+                        limit=5,
+                    ),
+                    intent=intent,
+                    kind=kind,
+                )
+            )
+        if historical_db is not None and intent == INTENT_HISTORICAL_EXPLOIT:
+            evidence.extend(
+                _historical_db_evidence(
+                    historical_db.match(query, protocol_category=kind),
+                    kind=kind,
+                )
+            )
+        return tuple(evidence)
+
+    return recall
+
+
+def _solodit_evidence(
+    findings: Iterable[SoloditFinding],
+    *,
+    intent: str,
+    kind: str,
+) -> tuple[MemoryEvidence, ...]:
+    out: list[MemoryEvidence] = []
+    prefix = (
+        "already reported duplicate risk"
+        if intent == INTENT_DUPLICATE_RISK
+        else "exploit prior art"
+    )
+    for finding in findings:
+        ident = finding.id or _slug(f"{finding.protocol}-{finding.title}")
+        out.append(
+            MemoryEvidence(
+                memory_id=f"solodit:{ident}",
+                trust=_solodit_trust(finding),
+                date="",
+                preview=(
+                    f"{prefix}: {finding.protocol} {finding.title} "
+                    f"{finding.severity} {finding.summary} tags={','.join(finding.tags)} "
+                    f"kind={kind}"
+                ).strip(),
+                role="historical",
+                source="solodit",
+            )
+        )
+    return tuple(out)
+
+
+def _historical_db_evidence(
+    exploits: Iterable[HistoricalExploit],
+    *,
+    kind: str,
+) -> tuple[MemoryEvidence, ...]:
+    out: list[MemoryEvidence] = []
+    for exploit in list(exploits)[:5]:
+        out.append(
+            MemoryEvidence(
+                memory_id=f"defihacklabs:{exploit.poc_path}",
+                trust=0.72,
+                date=exploit.date,
+                preview=(
+                    f"exploit prior art: {exploit.project} {exploit.tag} "
+                    f"poc={exploit.poc_path} chain={exploit.chain} kind={kind} "
+                    f"tags={','.join(exploit.tags)}"
+                ),
+                role="historical",
+                source="defihacklabs",
+            )
+        )
+    return tuple(out)
+
+
+def _solodit_trust(finding: SoloditFinding) -> float:
+    """Fold Solodit quality, rarity, and severity into memory trust."""
+
+    quality = {
+        "high": 0.18,
+        "medium": 0.10,
+        "low": 0.02,
+    }.get(finding.quality.strip().lower(), 0.08)
+    rarity = {
+        "rare": 0.16,
+        "uncommon": 0.10,
+        "common": 0.02,
+    }.get(finding.rarity.strip().lower(), 0.06)
+    severity = {
+        "critical": 0.16,
+        "high": 0.12,
+        "medium": 0.06,
+        "low": 0.02,
+    }.get(finding.severity.strip().lower(), 0.04)
+    return min(0.95, 0.45 + quality + rarity + severity)
+
+
+def _slug(text: str) -> str:
+    slug = re.sub(r"[^0-9a-zA-Z]+", "-", text.strip().lower()).strip("-")
+    return slug or "finding"
 
 
 def _error_target(
@@ -726,6 +1077,7 @@ def _finding_dict(finding: DriftFinding) -> dict[str, Any]:
         "message": finding.message,
         "expected": finding.expected,
         "actual": finding.actual,
+        "address": finding.address,
     }
 
 

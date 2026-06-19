@@ -27,7 +27,10 @@ from protocolgate.factory import (
     lane_signature,
     run_factory,
 )
+from protocolgate.forkpoc import DeltaAssertion, ForkPoCResult, STATUS_PROVEN_DELTA
 from protocolgate.memory import MemoryEvidence, MemoryResult
+from protocolgate.reasoning import ACTION_ARM_TEMPLATE, INTENT_HISTORICAL_EXPLOIT
+from protocolgate.router import ROUTE_ARM, ROUTE_SKIP
 
 
 # --------------------------------------------------------------------------- #
@@ -275,6 +278,132 @@ def test_known_dead_door_lane_is_skipped(tmp_path: Path) -> None:
     # A dead-door read-back was recorded for the proxy lane.
     proxy_readback = next(rb for rb in acme.readbacks if rb.kind == "proxy_admin_drift")
     assert proxy_readback.recalled_dead_door is True
+    assert proxy_readback.budget_decision is not None
+    assert proxy_readback.budget_decision.action == ROUTE_SKIP
+    assert proxy_readback.budget_decision.evidence == ("deadcap0",)
+    assert result.economics.scans_skipped == 1
+    assert result.economics.scans_spent == 0
+    assert result.economics.compute_saved_percent == 100.0
+
+
+def test_factory_records_scan_spend_for_live_lane(tmp_path: Path) -> None:
+    manifest = _write_manifest(tmp_path)
+    targets = _write_targets(tmp_path, manifest, rpc_url="http://rpc.local")
+    snapshot = {
+        "block": "0x123",
+        "contracts": [
+            {"name": "Vault", "address": PROXY, "proxy": {"admin": "0x9999999999999999999999999999999999999999"}}
+        ],
+        "multisigs": [{"name": "Gov", "address": SAFE, "threshold": 3}],
+    }
+    collector = FakeCollector(snapshots={"http://rpc.local": snapshot})
+
+    result = run_factory(
+        targets,
+        rpc_resolver=_resolver,
+        collect=collector,
+        vestige_client=FakeVestige(available=True),
+        base_scan_cost=2.0,
+    )
+
+    lane = result.results[0].lanes[0]
+    assert lane.budget_decision is not None
+    assert lane.budget_decision.should_scan is True
+    assert result.economics.scans_spent == 1
+    assert result.economics.scans_skipped == 0
+    assert result.economics.scan_cost_spent == 2.0
+    assert result.budget_queue[0].signature == lane.signature
+
+
+def test_historical_recall_reaches_lane_reasoning_and_budget(tmp_path: Path) -> None:
+    manifest = _write_manifest(tmp_path)
+    targets = _write_targets(tmp_path, manifest)
+    snapshot = {
+        "block": "0x123",
+        "contracts": [
+            {"name": "Vault", "address": PROXY, "proxy": {"admin": "0x9999999999999999999999999999999999999999"}}
+        ],
+        "multisigs": [{"name": "Gov", "address": SAFE, "threshold": 3}],
+    }
+    collector = FakeCollector(snapshots={"http://rpc.local": snapshot})
+
+    def recall(intent: str, query: str) -> tuple[MemoryEvidence, ...]:
+        if intent == INTENT_HISTORICAL_EXPLOIT:
+            return (
+                MemoryEvidence(
+                    memory_id="solodit:proxy-admin",
+                    trust=0.9,
+                    date="2024-01-01",
+                    preview="exploit: proxy admin takeover drained funds",
+                    role="historical",
+                    source="solodit",
+                ),
+            )
+        return ()
+
+    result = run_factory(
+        targets,
+        rpc_resolver=_resolver,
+        collect=collector,
+        vestige_client=FakeVestige(available=True),
+        historical_recall_fn=recall,
+    )
+
+    lane = result.results[0].lanes[0]
+    assert lane.reasoning_action == ACTION_ARM_TEMPLATE
+    assert "solodit:proxy-admin" in lane.reasoning_refs
+    assert lane.budget_decision is not None
+    assert lane.budget_decision.action == ROUTE_ARM
+    assert result.budget_queue[0].action == ROUTE_ARM
+
+
+def test_proven_poc_records_realized_usd_impact_without_promoting(tmp_path: Path) -> None:
+    manifest = _write_manifest(tmp_path)
+    targets = _write_targets(tmp_path, manifest)
+    snapshot = {
+        "block": "0x123",
+        "contracts": [
+            {"name": "Vault", "address": PROXY, "proxy": {"admin": "0x9999999999999999999999999999999999999999"}}
+        ],
+        "multisigs": [{"name": "Gov", "address": SAFE, "threshold": 3}],
+    }
+    collector = FakeCollector(snapshots={"http://rpc.local": snapshot})
+    verifier_calls: list[str] = []
+
+    def verifier(finding, fork, target_address, **kwargs) -> ForkPoCResult:
+        verifier_calls.append(target_address)
+        return ForkPoCResult(
+            status=STATUS_PROVEN_DELTA,
+            delta=DeltaAssertion(
+                subject=finding.subject,
+                metric="admin",
+                before=str(finding.expected),
+                after=str(finding.actual),
+                usd_impact=12_500.0,
+            ),
+        )
+
+    result = run_factory(
+        targets,
+        rpc_resolver=_resolver,
+        collect=collector,
+        vestige_client=FakeVestige(available=True),
+        run_poc=True,
+        poc_verifier=verifier,
+        base_scan_cost=2.0,
+    )
+
+    acme = result.results[0]
+    lane = acme.lanes[0]
+    assert verifier_calls == [PROXY]
+    assert acme.state == STATE_NEEDS_POC
+    assert acme.state != STATE_SUBMISSION_READY
+    assert lane.poc_proven is True
+    assert lane.poc_usd_impact == 12_500.0
+    assert result.economics.findings_proven == 1
+    assert result.economics.realized_usd_impact == 12_500.0
+    assert result.economics.realized_usd_per_scan == 12_500.0
+    assert result.economics.cost_per_finding == 2.0
 
 
 # --------------------------------------------------------------------------- #

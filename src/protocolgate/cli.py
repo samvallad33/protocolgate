@@ -31,6 +31,7 @@ from protocolgate.memory import DEFAULT_BASE_URL, VestigeClient, finding_query
 from protocolgate.opa import OpaUnavailable, evaluate_with_opa
 from protocolgate.report import EvidenceMap, findings_to_json, findings_to_markdown, print_findings
 from protocolgate.rules import evaluate_manifest
+from protocolgate.webhook import DRIFT_PATHS, run_webhook_server
 
 
 app = typer.Typer(
@@ -454,13 +455,75 @@ def factory(
     else:
         if not result.vestige_available:
             error_console.print("[yellow]vestige unavailable; cross-bounty read-back skipped[/yellow]")
+        _print_economics("factory", result.economics)
         for tr in result.results:
             console.print(f"[bold]{tr.name}[/bold] ({tr.chain}): {tr.state}")
+            _print_economics("  economics", tr.economics)
             for lane in tr.lanes:
                 tag = " [dim]skipped(dead-door)[/dim]" if lane.skipped_dead_door else ""
-                console.print(f"  {lane.kind} {lane.subject}: {lane.status}{tag}")
+                budget = (
+                    f" route={lane.budget_decision.action}"
+                    if lane.budget_decision is not None
+                    else ""
+                )
+                value = (
+                    f" usd=${lane.poc_usd_impact:,.0f}"
+                    if lane.poc_usd_impact
+                    else ""
+                )
+                console.print(
+                    f"  {lane.kind} {lane.subject}: {lane.status}{tag}{budget}{value}"
+                )
             for err in tr.errors:
                 error_console.print(f"  [yellow]warn:[/yellow] {err}")
+
+
+@app.command()
+def watch(
+    targets: Annotated[Path, typer.Argument(help="Path to targets.yaml")],
+    host: Annotated[str, typer.Option("--host", help="Interface to bind the receiver to")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", help="Port to listen on for drift events")] = 8787,
+) -> None:
+    """Run the event-driven factory loop: receive drift webhooks, scan on demand.
+
+    Starts a dependency-free stdlib HTTP receiver. A monitor (block explorer,
+    OZ Defender, Tenderly, Safe transaction service, or a custom hook) POSTs a
+    control-plane drift event to /drift; the receiver runs the
+    collect -> reason -> drift -> classify factory loop for the mapped target and
+    returns its classification. Non-control-plane events are acknowledged without
+    spending a scan. Read-only and fork-only downstream: never auto-promotes to
+    submission-ready and never submits. Ctrl-C to stop.
+    """
+
+    console.print(
+        f"[bold]protocolgate watch[/bold] listening on http://{host}:{port} "
+        f"(POST a drift event to {' or '.join(DRIFT_PATHS)})"
+    )
+    try:
+        run_webhook_server(targets, host, port)
+    except OSError as exc:
+        error_console.print(f"[red]watch error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+    except KeyboardInterrupt:
+        console.print("\n[dim]watch stopped[/dim]")
+
+
+def _print_economics(label: str, economics) -> None:
+    """Render the CORE-0 cost-per-finding counters in compact table output."""
+
+    console.print(
+        f"[dim]{label}: scans_spent={economics.scans_spent} "
+        f"scans_skipped={economics.scans_skipped} "
+        f"compute_saved={economics.compute_saved_percent:.1f}% "
+        f"cost_per_finding={_fmt_float(economics.cost_per_finding)} "
+        f"realized_usd_per_scan=${economics.realized_usd_per_scan:,.0f}[/dim]"
+    )
+
+
+def _fmt_float(value: float) -> str:
+    if value == float("inf"):
+        return "inf"
+    return f"{value:.2f}"
 
 
 if __name__ == "__main__":

@@ -34,7 +34,7 @@ Design constraints (load-bearing, do not violate):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Protocol
+from typing import Callable, Iterable, Protocol
 
 from protocolgate.memory import MemoryEvidence, MemoryResult
 
@@ -173,6 +173,31 @@ class VestigeQueryClient(Protocol):
 # ``MemoryResult``. Defaults to ``client.query``; injectable so tests can map a
 # scripted result per intent without a network.
 IntentQueryFn = Callable[[str, str], MemoryResult]
+
+# A callable that, given an intent name and its query string, returns historical
+# evidence pulled from a PUBLIC corpus connector (Solodit, DeFiHackLabs, ...) and
+# already mapped into the repo's ``MemoryEvidence`` shape. Defaults to ``None``
+# (a pure no-op: existing callers behave identically). When supplied it is
+# consulted ONLY for the two intents that reason over historical exploits and
+# prior public reports, and its matches are FOLDED INTO those intents' Vestige
+# evidence rather than replacing it.
+#
+# The connector layer (out of scope here) is responsible for trust-weighting:
+# each returned ``MemoryEvidence.trust`` should already encode Solodit
+# quality x rarity (e.g. a high-severity, rarely-seen finding scores near 1.0; a
+# common low-severity note scores below ``DEFAULT_TRUST_FLOOR`` so it cannot
+# fire an intent). ``source`` should mark provenance, e.g. ``"solodit"``.
+#
+# Bright line (see ``connectors``): Solodit is a public utility INPUT, never the
+# moat. The moat move is to dual-write *strong* Solodit matches back into the
+# private Vestige layer so it compounds. The wiring describes that ``smart_ingest``
+# call shape in ``_dual_write_hint`` below; it never performs network I/O here.
+HistoricalRecallFn = Callable[[str, str], "Iterable[MemoryEvidence] | MemoryResult | None"]
+
+# Intents allowed to fold in public-corpus (Solodit) recall. Dead-door and
+# prior-win reason over the PRIVATE bounty-sim layer only; mixing public corpus
+# into them would dilute those private signals, so they are deliberately excluded.
+_RECALL_FOLD_INTENTS = frozenset({INTENT_HISTORICAL_EXPLOIT, INTENT_DUPLICATE_RISK})
 
 
 # --------------------------------------------------------------------------- #
@@ -397,6 +422,151 @@ def _rationale_for(intent: str, count: int, top_trust: float) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Public-corpus (Solodit) fold-in
+# --------------------------------------------------------------------------- #
+
+
+def _coerce_recall(recall: object) -> tuple[MemoryEvidence, ...]:
+    """Normalise a ``historical_recall_fn`` return value to evidence.
+
+    Accepts ``None``, a ``MemoryResult``, or any iterable of ``MemoryEvidence``
+    so the connector layer can return whichever shape is convenient. Anything
+    else is treated as empty. Never raises (advisory contract).
+    """
+
+    if recall is None:
+        return ()
+    if isinstance(recall, MemoryResult):
+        if not getattr(recall, "available", False):
+            return ()
+        recall = recall.evidence or ()
+    out: list[MemoryEvidence] = []
+    try:
+        for item in recall:  # type: ignore[union-attr]
+            if isinstance(item, MemoryEvidence):
+                out.append(item)
+    except TypeError:
+        return ()
+    return tuple(out)
+
+
+def _merge_intent(base: IntentResult, extra: IntentResult) -> IntentResult:
+    """Fold a Solodit-derived ``IntentResult`` into the Vestige one for an intent.
+
+    Union of refs (order-preserved, Vestige first), max top trust, matched iff
+    either matched. The rationale notes the Solodit contribution so the
+    ``evidence -> implication`` half stays explainable.
+    """
+
+    if not extra.matched:
+        return base
+
+    seen: set[str] = set()
+    refs: list[str] = []
+    for ref in (*base.refs, *extra.refs):
+        if ref and ref not in seen:
+            seen.add(ref)
+            refs.append(ref)
+
+    top_trust = max(base.top_trust, extra.top_trust)
+    count = len(refs)
+    rationale = (
+        f"{_rationale_for(base.intent, count, top_trust)} "
+        f"(+{len(extra.refs)} solodit)"
+    )
+    return IntentResult(
+        intent=base.intent,
+        query=base.query,
+        matched=True,
+        refs=tuple(refs),
+        top_trust=top_trust,
+        rationale=rationale,
+    )
+
+
+def _fold_historical_recall(
+    intents: list[IntentResult],
+    *,
+    recall_fn: HistoricalRecallFn,
+    target: str,
+    subject: str,
+    kind: str,
+    finding: str,
+    trust_floor: float,
+) -> list[IntentResult]:
+    """Augment HISTORICAL_EXPLOIT / DUPLICATE_RISK with public-corpus recall.
+
+    Pure-additive: the Solodit evidence is run through the SAME trust-floor and
+    marker classifier as Vestige evidence (so a weak Solodit hit cannot fire an
+    intent on its own), then merged into the matching intent's row. Never raises;
+    a failing or empty recall leaves ``intents`` untouched.
+    """
+
+    by_intent = {INTENT_HISTORICAL_EXPLOIT: EXPLOIT_MARKERS, INTENT_DUPLICATE_RISK: DUPLICATE_MARKERS}
+    out: list[IntentResult] = []
+    for current in intents:
+        markers = by_intent.get(current.intent)
+        if markers is None or current.intent not in _RECALL_FOLD_INTENTS:
+            out.append(current)
+            continue
+        try:
+            raw = recall_fn(current.intent, current.query)
+            evidence = _coerce_recall(raw)
+        except Exception:  # noqa: BLE001 - advisory: recall failure is non-fatal
+            out.append(current)
+            continue
+        if not evidence:
+            out.append(current)
+            continue
+        solodit_result = MemoryResult(available=True, confidence=1.0, evidence=evidence)
+        solodit_intent = _classify_intent(
+            current.intent, current.query, solodit_result, markers, trust_floor
+        )
+        merged = _merge_intent(current, solodit_intent)
+        if merged.matched and not current.matched:
+            # A purely-Solodit match is worth dual-writing back into the private
+            # layer so the moat compounds. We only describe the call; no network.
+            _dual_write_hint(target, subject, kind, finding, solodit_intent)
+        out.append(merged)
+    return out
+
+
+def _dual_write_hint(
+    target: str,
+    subject: str,
+    kind: str,
+    finding: str,
+    solodit_intent: IntentResult,
+) -> None:
+    """Describe (do NOT perform) the moat dual-write of a strong Solodit match.
+
+    The bright-line moat move: when a public-corpus finding clears the trust
+    floor and fires an intent, mirror it into the PRIVATE Vestige layer so the
+    trust-weighted memory compounds over time. The actual write belongs to the
+    factory's write path (it already owns the stdio ``smart_ingest`` channel via
+    ``bounty_sim``); reasoning is advisory and stays network-free. The intended
+    call shape is::
+
+        smart_ingest(
+            content=(
+                f"[solodit-mirror] {lane_signature(target, subject, kind)} "
+                f"intent={solodit_intent.intent} "
+                f"refs={','.join(solodit_intent.refs)} "
+                f"trust={solodit_intent.top_trust:.2f} "
+                f"finding={finding[:300]}"
+            ),
+            source="protocolgate:solodit-mirror",
+            tags=["historical-exploit", kind, target],
+        )
+
+    This is intentionally a no-op here so reasoning never blocks on or fails from
+    a write. The connector/factory layer decides when to actually emit it.
+    """
+
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # Top-level synthesis
 # --------------------------------------------------------------------------- #
 
@@ -410,6 +580,7 @@ def judge_lane(
     finding: str | None = None,
     trust_floor: float = DEFAULT_TRUST_FLOOR,
     intent_query_fn: IntentQueryFn | None = None,
+    historical_recall_fn: HistoricalRecallFn | None = None,
 ) -> LaneJudgment:
     """Reason across bounty memory for one lane and return a :class:`LaneJudgment`.
 
@@ -434,6 +605,17 @@ def judge_lane(
         Injectable ``(intent, query) -> MemoryResult``. Defaults to wrapping
         ``client.query`` (which ignores the intent name). Tests use it to script
         a different result per intent without a network.
+    historical_recall_fn:
+        OPTIONAL injectable ``(intent, query) -> Iterable[MemoryEvidence] |
+        MemoryResult | None`` that pulls public-corpus (Solodit / DeFiHackLabs)
+        matches and folds them into the HISTORICAL_EXPLOIT and DUPLICATE_RISK
+        intents only. ``None`` (the default) is a pure no-op: behaviour is
+        identical to before. Matches are trust-floor + marker filtered exactly
+        like Vestige evidence, so a weak public hit never fires an intent on its
+        own. The returned evidence is expected to be trust-weighted by Solodit
+        quality x rarity in the connector layer. Strong purely-public matches are
+        candidates for a dual-write back into the private Vestige layer (see
+        ``_dual_write_hint``); this function never performs network I/O.
     """
 
     signature = lane_signature(target, subject, kind)
@@ -468,6 +650,19 @@ def judge_lane(
             )
             continue
         intents.append(_classify_intent(intent_name, query, result, markers, trust_floor))
+
+    # Pure-additive: when a public-corpus recall fn is supplied, fold Solodit
+    # matches into the historical-exploit / duplicate-risk intents. No fn -> no-op.
+    if historical_recall_fn is not None:
+        intents = _fold_historical_recall(
+            intents,
+            recall_fn=historical_recall_fn,
+            target=target,
+            subject=subject,
+            kind=kind,
+            finding=finding or "",
+            trust_floor=trust_floor,
+        )
 
     return _synthesize(signature, tuple(intents))
 

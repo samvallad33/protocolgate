@@ -374,3 +374,155 @@ def test_finding_context_reaches_the_runner() -> None:
     )
     # Every intent query carried the finding context.
     assert all("threshold dropped" in query for _intent, query in runner.calls)  # type: ignore[attr-defined]
+
+
+# --------------------------------------------------------------------------- #
+# 6. Public-corpus (Solodit) fold-in via historical_recall_fn
+# --------------------------------------------------------------------------- #
+
+
+def _solodit_evidence(memory_id: str, preview: str, trust: float = 0.92) -> MemoryEvidence:
+    # Trust already encodes Solodit quality x rarity (done in the connector layer).
+    return MemoryEvidence(
+        memory_id=memory_id,
+        trust=trust,
+        date="2023-03-01",
+        preview=preview,
+        role="historical",
+        source="solodit",
+    )
+
+
+def test_historical_recall_fn_default_none_is_a_noop() -> None:
+    # No recall fn -> identical behaviour to before: only Vestige evidence counts.
+    runner = scripted_runner(
+        {INTENT_HISTORICAL_EXPLOIT: _result(_evidence("explo000", "post-mortem: unprotected upgrade authority drain"))}
+    )
+    baseline = judge_lane(TARGET, SUBJECT, KIND, FakeClient(), intent_query_fn=runner)
+
+    runner2 = scripted_runner(
+        {INTENT_HISTORICAL_EXPLOIT: _result(_evidence("explo000", "post-mortem: unprotected upgrade authority drain"))}
+    )
+    with_none = judge_lane(
+        TARGET, SUBJECT, KIND, FakeClient(), intent_query_fn=runner2,
+        historical_recall_fn=None,
+    )
+
+    assert with_none.action == baseline.action == ACTION_ARM_TEMPLATE
+    assert with_none.evidence_refs == baseline.evidence_refs == ("explo000",)
+
+
+def test_historical_recall_fn_adds_refs_to_historical_exploit() -> None:
+    # Vestige has no exploit recall; an injected Solodit recall fires the intent.
+    runner = scripted_runner({})  # every Vestige intent returns EMPTY
+
+    def recall(intent: str, query: str) -> tuple[MemoryEvidence, ...]:
+        if intent == INTENT_HISTORICAL_EXPLOIT:
+            return (_solodit_evidence("solex001", "exploit: proxy admin takeover drained vault"),)
+        return ()
+
+    judgment = judge_lane(
+        TARGET, SUBJECT, KIND, FakeClient(), intent_query_fn=runner,
+        historical_recall_fn=recall,
+    )
+
+    assert judgment.action == ACTION_ARM_TEMPLATE
+    assert "solex001" in judgment.evidence_refs
+    fired = next(i for i in judgment.fired_intents if i.intent == INTENT_HISTORICAL_EXPLOIT)
+    assert fired.top_trust == pytest.approx(0.92)
+    assert "solodit" in fired.rationale
+
+
+def test_historical_recall_fn_merges_with_vestige_refs() -> None:
+    # Vestige already fired the intent; Solodit recall is folded in additively.
+    runner = scripted_runner(
+        {INTENT_HISTORICAL_EXPLOIT: _result(_evidence("explo000", "post-mortem: oracle manipulation bridge drain"))}
+    )
+
+    def recall(intent: str, query: str) -> tuple[MemoryEvidence, ...]:
+        if intent == INTENT_HISTORICAL_EXPLOIT:
+            return (_solodit_evidence("solex001", "exploit: admin takeover drained funds"),)
+        return ()
+
+    judgment = judge_lane(
+        TARGET, SUBJECT, KIND, FakeClient(), intent_query_fn=runner,
+        historical_recall_fn=recall,
+    )
+
+    assert judgment.action == ACTION_ARM_TEMPLATE
+    # Union of Vestige + Solodit refs, Vestige first.
+    assert judgment.evidence_refs == ("explo000", "solex001")
+
+
+def test_historical_recall_fn_below_trust_floor_does_not_fire() -> None:
+    # A weak (low quality x rarity) Solodit hit cannot fire an intent on its own.
+    runner = scripted_runner({})
+
+    def recall(intent: str, query: str) -> tuple[MemoryEvidence, ...]:
+        if intent == INTENT_HISTORICAL_EXPLOIT:
+            return (_solodit_evidence("weaksol0", "exploit drain", trust=0.20),)
+        return ()
+
+    judgment = judge_lane(
+        TARGET, SUBJECT, KIND, FakeClient(), intent_query_fn=runner,
+        historical_recall_fn=recall,
+    )
+    assert judgment.action == ACTION_PROCEED
+    assert judgment.fired_intents == ()
+
+
+def test_historical_recall_fn_not_folded_into_dead_door_or_prior_win() -> None:
+    # Recall is consulted ONLY for HISTORICAL_EXPLOIT / DUPLICATE_RISK. Even a
+    # high-trust marker-matching hit returned for other intents is ignored.
+    runner = scripted_runner({})
+    asked: list[str] = []
+
+    def recall(intent: str, query: str) -> tuple[MemoryEvidence, ...]:
+        asked.append(intent)
+        # Return something that WOULD match dead-door/prior-win markers if folded.
+        return (_solodit_evidence("solany0", "dead-door closed lane PAID confirmed critical"),)
+
+    judgment = judge_lane(
+        TARGET, SUBJECT, KIND, FakeClient(), intent_query_fn=runner,
+        historical_recall_fn=recall,
+    )
+
+    # Only the two fold-eligible intents ever consult the recall fn.
+    assert set(asked) == {INTENT_HISTORICAL_EXPLOIT, INTENT_DUPLICATE_RISK}
+    # And neither dead-door (skip) nor prior-win fired from public corpus.
+    assert judgment.action != ACTION_SKIP
+    assert all(i.intent not in (INTENT_DEAD_DOOR, INTENT_PRIOR_WIN) for i in judgment.fired_intents)
+
+
+def test_historical_recall_fn_raising_is_not_fatal() -> None:
+    # A blowing-up recall fn degrades to Vestige-only; never raises.
+    runner = scripted_runner(
+        {INTENT_HISTORICAL_EXPLOIT: _result(_evidence("explo000", "post-mortem: unprotected upgrade authority drain"))}
+    )
+
+    def recall(intent: str, query: str):
+        raise RuntimeError("solodit fetch blew up")
+
+    judgment = judge_lane(
+        TARGET, SUBJECT, KIND, FakeClient(), intent_query_fn=runner,
+        historical_recall_fn=recall,
+    )
+    assert judgment.action == ACTION_ARM_TEMPLATE
+    assert judgment.evidence_refs == ("explo000",)
+
+
+def test_historical_recall_fn_accepts_memory_result_shape() -> None:
+    # The recall fn may also return a MemoryResult (not just a bare iterable).
+    runner = scripted_runner({})
+
+    def recall(intent: str, query: str) -> MemoryResult:
+        if intent == INTENT_DUPLICATE_RISK:
+            return _result(_solodit_evidence("soldup0", "this exact finding already reported / duplicate disclosed"))
+        return EMPTY
+
+    judgment = judge_lane(
+        TARGET, SUBJECT, KIND, FakeClient(), intent_query_fn=runner,
+        historical_recall_fn=recall,
+    )
+    assert judgment.action == ACTION_FLAG_DUPLICATE
+    assert "soldup0" in judgment.evidence_refs

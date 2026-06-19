@@ -11,6 +11,7 @@ class DriftFinding:
     message: str
     expected: Any
     actual: Any
+    address: str = ""
 
 
 def compare_snapshot(manifest: dict[str, Any], snapshot: dict[str, Any]) -> list[DriftFinding]:
@@ -39,6 +40,7 @@ def compare_snapshot(manifest: dict[str, Any], snapshot: dict[str, Any]) -> list
                     message="contract missing from live snapshot",
                     expected="present",
                     actual="missing",
+                    address=str(contract.get("address") or ""),
                 )
             )
             continue
@@ -54,6 +56,7 @@ def compare_snapshot(manifest: dict[str, Any], snapshot: dict[str, Any]) -> list
                     message="proxy admin missing from live snapshot",
                     expected=expected_admin,
                     actual=None,
+                    address=str(live.get("address") or contract.get("address") or ""),
                 )
             )
         elif expected_admin and actual_admin != expected_admin:
@@ -64,6 +67,7 @@ def compare_snapshot(manifest: dict[str, Any], snapshot: dict[str, Any]) -> list
                     message="proxy admin drifted from manifest",
                     expected=expected_admin,
                     actual=actual_admin,
+                    address=str(live.get("address") or contract.get("address") or ""),
                 )
             )
 
@@ -84,6 +88,7 @@ def compare_snapshot(manifest: dict[str, Any], snapshot: dict[str, Any]) -> list
                     message="multisig missing from live snapshot",
                     expected="present",
                     actual="missing",
+                    address=str(multisig.get("address") or ""),
                 )
             )
             continue
@@ -98,6 +103,7 @@ def compare_snapshot(manifest: dict[str, Any], snapshot: dict[str, Any]) -> list
                     message="multisig threshold missing from live snapshot",
                     expected=expected,
                     actual=None,
+                    address=str(live_multisigs[name].get("address") or multisig.get("address") or ""),
                 )
             )
         elif expected is not None and actual != expected:
@@ -108,6 +114,7 @@ def compare_snapshot(manifest: dict[str, Any], snapshot: dict[str, Any]) -> list
                     message="multisig threshold drifted from manifest",
                     expected=expected,
                     actual=actual,
+                    address=str(live_multisigs[name].get("address") or multisig.get("address") or ""),
                 )
             )
 

@@ -37,10 +37,15 @@ Design constraints (load-bearing, do not violate):
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import logging
+import os
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any, Callable
 
 from protocolgate.factory import FactoryError, TargetResult, run_factory
@@ -52,9 +57,51 @@ from protocolgate.trigger import (
     parse_monitor_event,
 )
 
+_LOG = logging.getLogger("protocolgate.webhook")
+
 # The path the monitor POSTs drift events to. A monitor that cannot be told a
 # path can POST to ``/`` as well (handled identically); everything else 404s.
 DRIFT_PATHS = ("/drift", "/")
+
+# Env var holding the shared HMAC secret. When SET, every drift POST must carry
+# a valid ``X-ProtocolGate-Signature`` header or it is rejected 401 before any
+# JSON parse or factory work runs. When UNSET, the receiver stays open (current
+# behavior) but logs a warning so the unauthenticated state is opt-in, visible,
+# and never the silent default in prod.
+WEBHOOK_SECRET_ENV = "PROTOCOLGATE_WEBHOOK_SECRET"
+# Header the monitor signs the raw body with: ``sha256=<hexdigest>`` of
+# HMAC-SHA256(secret, raw_body).
+SIGNATURE_HEADER = "X-ProtocolGate-Signature"
+_SIGNATURE_PREFIX = "sha256="
+
+
+def _compute_signature(secret: str, body: bytes) -> str:
+    """Return the ``sha256=<hexdigest>`` HMAC-SHA256 signature for ``body``."""
+
+    digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    return f"{_SIGNATURE_PREFIX}{digest}"
+
+
+def _is_authorized(secret: str, body: bytes, signature_header: str | None) -> bool:
+    """Constant-time check that ``signature_header`` matches ``body`` under ``secret``.
+
+    A missing or malformed header is unauthorized. The comparison is over the
+    full ``sha256=<hexdigest>`` form using :func:`hmac.compare_digest` so neither
+    the digest nor the prefix leaks via timing.
+
+    ``hmac.compare_digest`` raises ``TypeError`` when a ``str`` operand contains
+    non-ASCII characters, so a non-ASCII signature header would otherwise crash
+    the authenticated path (DoS). A valid signature is always ASCII hex, so we
+    reject any non-ASCII header as unauthorized rather than letting it raise.
+    """
+
+    if not signature_header:
+        return False
+    candidate = signature_header.strip()
+    if not candidate.isascii():
+        return False
+    expected = _compute_signature(secret, body)
+    return hmac.compare_digest(expected, candidate)
 
 # An injectable factory runner matching :func:`protocolgate.factory.run_factory`'s
 # shape so tests inject a fake that returns a canned ``FactoryResult`` with no
@@ -77,6 +124,21 @@ class WebhookRequest:
     method: str
     path: str
     body: bytes = b""
+    # Case-insensitive view of inbound HTTP headers. The real handler fills this
+    # from the socket; tests build it by hand. Only used for the optional HMAC
+    # auth check, which runs on the raw ``body`` before any JSON parse.
+    headers: Mapping[str, str] | None = None
+
+    def header(self, name: str) -> str | None:
+        """Case-insensitive single-header lookup. ``None`` when absent."""
+
+        if not self.headers:
+            return None
+        lowered = name.lower()
+        for key, value in self.headers.items():
+            if key.lower() == lowered:
+                return value
+        return None
 
 
 @dataclass(frozen=True)
@@ -221,6 +283,25 @@ def handle_drift_event(
     if request.path not in DRIFT_PATHS:
         return WebhookResponse(404, {"error": "not found", "path": request.path})
 
+    # HMAC gate (opt-in). When the shared secret is configured, every drift POST
+    # must carry a valid signature over the RAW body before we parse JSON or
+    # spend a scan -- this closes the unauthenticated DoS amplifier (RPC fan-out
+    # + subprocess spawns on any anonymous POST). When unset we stay open for
+    # local dev but warn loudly so the unauthenticated state is never silent.
+    secret = os.environ.get(WEBHOOK_SECRET_ENV)
+    if secret:
+        if not _is_authorized(secret, request.body, request.header(SIGNATURE_HEADER)):
+            return WebhookResponse(401, {"error": "invalid or missing signature"})
+    else:
+        _LOG.warning(
+            "%s is not set: the drift webhook is UNAUTHENTICATED. Any POST to %s "
+            "can trigger a factory scan. Set %s to require %s HMAC-SHA256 auth.",
+            WEBHOOK_SECRET_ENV,
+            " or ".join(DRIFT_PATHS),
+            WEBHOOK_SECRET_ENV,
+            SIGNATURE_HEADER,
+        )
+
     try:
         payload = json.loads(request.body.decode("utf-8") or "{}")
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -351,7 +432,12 @@ def _build_request_handler(handler: DriftHandler) -> type[BaseHTTPRequestHandler
             return self.rfile.read(length)
 
         def do_POST(self) -> None:  # noqa: N802 - http.server naming
-            request = WebhookRequest(method="POST", path=self.path, body=self._read_body())
+            request = WebhookRequest(
+                method="POST",
+                path=self.path,
+                body=self._read_body(),
+                headers={k: v for k, v in self.headers.items()},
+            )
             self._respond(handler(request))
 
         def do_GET(self) -> None:  # noqa: N802 - http.server naming

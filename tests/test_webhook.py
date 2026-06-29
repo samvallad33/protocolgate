@@ -23,8 +23,11 @@ import pytest
 from protocolgate.factory import FactoryError, FactoryResult, LaneResult, TargetResult
 from protocolgate.trigger import DriftEvent, is_control_plane_event
 from protocolgate.webhook import (
+    SIGNATURE_HEADER,
+    WEBHOOK_SECRET_ENV,
     WebhookRequest,
     WebhookResponse,
+    _compute_signature,
     handle_drift_event,
     map_event_to_target,
     parse_monitor_event,
@@ -334,3 +337,104 @@ def test_default_handler_wired_through_run_webhook_server(tmp_path: Path) -> Non
     assert response.status == 200
     assert response.payload["target"] == "Acme"
     assert handler is not None
+
+
+# --------------------------------------------------------------------------- #
+# HMAC auth gate (optional, opt-in via PROTOCOLGATE_WEBHOOK_SECRET)
+# --------------------------------------------------------------------------- #
+
+
+_SECRET = "s3cr3t-shared-key"
+
+
+def _signed_post(path: str, payload: dict, secret: str) -> WebhookRequest:
+    body = json.dumps(payload).encode("utf-8")
+    signature = _compute_signature(secret, body)
+    return WebhookRequest(
+        method="POST", path=path, body=body, headers={SIGNATURE_HEADER: signature}
+    )
+
+
+def test_secret_set_with_correct_signature_is_accepted(monkeypatch) -> None:
+    monkeypatch.setenv(WEBHOOK_SECRET_ENV, _SECRET)
+    factory = FakeFactory(result=_factory_result(_target_result("Acme", "needs-PoC")))
+    request = _signed_post(
+        "/drift", {"event_type": "AdminChanged", "target": "Acme", "address": PROXY}, _SECRET
+    )
+
+    response = handle_drift_event(request, targets_path="targets.yaml", factory_fn=factory)
+
+    assert response.status == 200
+    assert response.payload["target"] == "Acme"
+    assert factory.calls == ["targets.yaml"]
+
+
+def test_secret_set_with_wrong_signature_is_401_and_never_scans(monkeypatch) -> None:
+    monkeypatch.setenv(WEBHOOK_SECRET_ENV, _SECRET)
+    factory = FakeFactory(result=_factory_result(_target_result("Acme")))
+    # Signed with the wrong key -> digest mismatch.
+    request = _signed_post(
+        "/drift", {"event_type": "AdminChanged", "target": "Acme"}, "not-the-real-secret"
+    )
+
+    response = handle_drift_event(request, targets_path="targets.yaml", factory_fn=factory)
+
+    assert response.status == 401
+    # DoS amplifier closed: the factory is never invoked on an unauthorized POST.
+    assert factory.calls == []
+
+
+def test_secret_set_with_missing_header_is_401_and_never_scans(monkeypatch) -> None:
+    monkeypatch.setenv(WEBHOOK_SECRET_ENV, _SECRET)
+    factory = FakeFactory(result=_factory_result(_target_result("Acme")))
+    # No signature header at all (the unauthenticated-POST attack).
+    request = _post("/drift", {"event_type": "AdminChanged", "target": "Acme"})
+
+    response = handle_drift_event(request, targets_path="targets.yaml", factory_fn=factory)
+
+    assert response.status == 401
+    assert factory.calls == []
+
+
+def test_non_ascii_signature_is_401_not_500(monkeypatch) -> None:
+    # Regression: a non-ASCII X-ProtocolGate-Signature header used to crash the
+    # authenticated path (hmac.compare_digest raises TypeError on non-ASCII str),
+    # turning a malformed header into a 500/DoS. It must now be a clean 401.
+    monkeypatch.setenv(WEBHOOK_SECRET_ENV, _SECRET)
+    factory = FakeFactory(result=_factory_result(_target_result("Acme")))
+    body = json.dumps({"event_type": "AdminChanged", "target": "Acme"}).encode("utf-8")
+    request = WebhookRequest(
+        method="POST",
+        path="/drift",
+        body=body,
+        headers={SIGNATURE_HEADER: "sha256=déadbeefÿ"},  # non-ASCII
+    )
+
+    response = handle_drift_event(request, targets_path="targets.yaml", factory_fn=factory)
+
+    assert response.status == 401
+    assert factory.calls == []
+
+
+def test_no_secret_set_stays_open_for_backward_compat(monkeypatch) -> None:
+    # Secret unset -> preserve the original open behavior (local dev / existing tests).
+    monkeypatch.delenv(WEBHOOK_SECRET_ENV, raising=False)
+    factory = FakeFactory(result=_factory_result(_target_result("Acme")))
+    request = _post("/drift", {"event_type": "AdminChanged", "target": "Acme", "address": PROXY})
+
+    response = handle_drift_event(request, targets_path="targets.yaml", factory_fn=factory)
+
+    assert response.status == 200
+    assert response.payload["target"] == "Acme"
+    assert factory.calls == ["targets.yaml"]
+
+
+def test_no_secret_set_logs_unauthenticated_warning(monkeypatch, caplog) -> None:
+    monkeypatch.delenv(WEBHOOK_SECRET_ENV, raising=False)
+    factory = FakeFactory(result=_factory_result(_target_result("Acme")))
+    request = _post("/drift", {"event_type": "AdminChanged", "target": "Acme", "address": PROXY})
+
+    with caplog.at_level("WARNING", logger="protocolgate.webhook"):
+        handle_drift_event(request, targets_path="targets.yaml", factory_fn=factory)
+
+    assert any("UNAUTHENTICATED" in rec.message for rec in caplog.records)

@@ -1204,7 +1204,7 @@ def default_vestige_writer(
     *,
     command: str = "vestige-mcp",
     timeout_seconds: int = 45,
-) -> None:
+) -> int:
     """Default MOAT sink: ship capsules through the stdio ``smart_ingest`` path.
 
     Reuses :func:`protocolgate.bounty_sim.smart_ingest_stdio` -- the exact same
@@ -1212,16 +1212,21 @@ def default_vestige_writer(
     Degrades gracefully end to end: empty capsule set, a missing ``vestige-mcp``
     binary, a subprocess failure, or a timeout are all silent no-ops. NEVER
     raises into the loop. Items are capped to stay within one batch.
+
+    Returns the number of capsules actually shipped to Vestige (0 when the write
+    was a no-op or failed). Callers that report a "learned" count MUST use this
+    return value, not ``len(capsules)`` -- otherwise a missing binary or a failed
+    write would be reported as a successful learn (silent degradation).
     """
 
     if not capsules:
-        return
+        return 0
     resolved = shutil.which(command)
     if resolved is None:
-        return
+        return 0
     items = [_capsule_to_smart_ingest_item(capsule) for capsule in capsules][:20]
     if not items:
-        return
+        return 0
     try:
         smart_ingest_stdio(
             items,
@@ -1230,7 +1235,8 @@ def default_vestige_writer(
             client_name="protocolgate-factory",
         )
     except (subprocess.SubprocessError, OSError):
-        return
+        return 0
+    return len(items)
 
 
 def _target_prior_usd(target: FactoryTarget) -> float:

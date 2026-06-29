@@ -8,7 +8,15 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field
 
+import os
+
 from protocolgate.bounty_scope import analyze_bounty_reportability
+from protocolgate.manifest import ManifestError, load_manifest
+from protocolgate.rules import evaluate_manifest
+from protocolgate.hunt import hunt_manifest
+from protocolgate.report import findings_to_json
+from protocolgate.capsules import validate_verdict_capsules, hunt_verdict_capsules
+from protocolgate.factory import default_vestige_writer
 from protocolgate.revenue import (
     PROJECT_ROOT,
     build_offer,
@@ -554,6 +562,119 @@ def _truncate(text: str) -> str:
         text[:CHARACTER_LIMIT]
         + "\n\n[truncated: narrow the request or use JSON output to inspect specific fields]"
     )
+
+
+# ---------------------------------------------------------------------------
+# THE GATE (control-plane security tools) — makes ProtocolGate's deterministic
+# policy gate callable from a Hermes agent / any MCP client, not just the CLI.
+# These wrap the canonical built-in engine (load_manifest -> evaluate/hunt).
+# Read-only: they evaluate a declared manifest, they never deploy or sign.
+# ---------------------------------------------------------------------------
+
+
+class ManifestInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    manifest_path: str = Field(
+        description="Path to a protocolgate.yaml control-plane topology manifest.",
+    )
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+
+
+def _maybe_learn(builder, *, manifest, target, findings) -> int:
+    """When PROTOCOLGATE_LEARN=1, write verdict capsules to Vestige so the gate compounds.
+
+    Advisory-not-authority: capsules RECORD what the deterministic verdict already decided;
+    they never gate. default_vestige_writer is a silent no-op if vestige-mcp is absent and
+    never raises — so learning can never break a scan. Returns the capsule count written.
+    """
+    if os.environ.get("PROTOCOLGATE_LEARN") != "1":
+        return 0
+    try:
+        caps = builder(manifest=manifest, target=target, findings=findings)
+        # Report what actually landed in Vestige, not what we built. A missing
+        # vestige-mcp binary or a failed write returns 0 here, so the caller's
+        # `learned_capsules` count never falsely claims a successful learn.
+        return default_vestige_writer(caps)
+    except Exception:
+        # Learning is best-effort; a write failure must never affect the verdict.
+        return 0
+
+
+def _findings_payload(findings: list, *, mode: str, manifest_path: str) -> dict:
+    """Compact, agent-friendly summary of a gate run (also feeds learning capsules)."""
+    by_sev: dict[str, int] = {}
+    rows = []
+    for f in findings:
+        sev = getattr(f, "severity", "unknown")
+        by_sev[sev] = by_sev.get(sev, 0) + 1
+        rows.append(
+            {
+                "rule": getattr(f, "rule_id", None),
+                "severity": sev,
+                "path": getattr(f, "path", None),
+                "finding": getattr(f, "message", None),
+                "fix": getattr(f, "recommendation", None),
+            }
+        )
+    verdict = "fail" if findings else "pass"
+    return {
+        "mode": mode,
+        "manifest": manifest_path,
+        "verdict": verdict,
+        "finding_count": len(findings),
+        "by_severity": by_sev,
+        "findings": rows,
+    }
+
+
+@mcp.tool(
+    name="protocolgate_validate",
+    annotations={"title": "Validate Control-Plane Manifest", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+async def protocolgate_validate(params: ManifestInput) -> str:
+    """Gate a Web3 deployment topology manifest before deploy/upgrade/audit.
+
+    Runs the canonical control-plane rules (proxy/upgrade admin, multisig thresholds,
+    timelocks, treasury splits, bridge limits, oracle assumptions, guardian/emergency
+    powers, proposal-intent/calldata-substitution). Returns pass/fail + findings.
+    Deterministic gate: exit-equivalent verdict is 'fail' if any finding is present.
+    """
+    try:
+        data = load_manifest(Path(params.manifest_path))
+    except ManifestError as exc:
+        return _format({"error": f"manifest error: {exc}"}, params.response_format)
+    findings = evaluate_manifest(data)
+    learned = _maybe_learn(validate_verdict_capsules, manifest=data, target=params.manifest_path, findings=findings)
+    payload = _findings_payload(findings, mode="validate", manifest_path=params.manifest_path)
+    payload["learned_capsules"] = learned
+    if params.response_format is ResponseFormat.JSON:
+        return findings_to_json(findings)
+    return _format(payload, params.response_format)
+
+
+@mcp.tool(
+    name="protocolgate_hunt",
+    annotations={"title": "Hunt Control-Plane Weak Doors", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+async def protocolgate_hunt(params: ManifestInput) -> str:
+    """Advisory hunt for bounty-oriented control-plane invariant mismatches.
+
+    Surfaces 'weird doors' (e.g. a safety control scoped narrower than the predicate
+    it protects, the Aave grace-bypass class). Always advisory (never a gate verdict);
+    findings are candidate exploit lanes for a human to trace, not proven exploits.
+    """
+    try:
+        data = load_manifest(Path(params.manifest_path))
+    except ManifestError as exc:
+        return _format({"error": f"manifest error: {exc}"}, params.response_format)
+    findings = hunt_manifest(data)
+    learned = _maybe_learn(hunt_verdict_capsules, manifest=data, target=params.manifest_path, findings=findings)
+    payload = _findings_payload(findings, mode="hunt", manifest_path=params.manifest_path)
+    payload["learned_capsules"] = learned
+    if params.response_format is ResponseFormat.JSON:
+        return findings_to_json(findings)
+    return _format(payload, params.response_format)
 
 
 def main() -> None:

@@ -1,0 +1,133 @@
+version: 1
+
+project:
+  name: Aave Governance V3 Ethereum
+  category: Public Web3 control-plane fixture
+  source_repo: aave-dao/aave-governance-v3
+  source_commit: 5b240b1
+  scope_note: "Modeled case-study manifest from public repo deployment files and governance docs; executor contracts are represented as delayed admin control paths."
+
+deployment:
+  environment: production
+  chain: ethereum-mainnet
+  chain_id: 1
+  allowed_deployers:
+    - AaveLevel2ExecutorTimelock
+
+governance:
+  quorum_bps: 500
+  voting_period_seconds: 259200
+
+governors:
+  - name: AaveGovernanceV3
+    address: "0x9AEE0B04504CeF83A65AC3f0e838D0593BCb2BC7"
+    kind: aave-governance-v3
+    voting_delay_seconds: 86400
+    voting_period_seconds: 259200
+    timelock: AaveLevel1ExecutorTimelock
+
+timelocks:
+  - name: AaveLevel1ExecutorTimelock
+    address: "0x5300A1a15135EA4dc7aD5a167152C01EFc9b192A"
+    delay_seconds: 86400
+    proposer: AaveGovernanceV3
+    executor: AaveGovernanceV3
+  - name: AaveLevel2ExecutorTimelock
+    address: "0x17Dd33Ed0e3dD2a80E37489B8A63063161BE6957"
+    delay_seconds: 864000
+    proposer: AaveGovernanceV3
+    executor: AaveGovernanceV3
+
+guardians:
+  - name: AaveGuardian
+    address: "0xEAF6183bAb3eFD3bF856Ac5C058431C8592394d6"
+    powers: []
+
+bridges:
+  - name: AaveCrossChainGovernanceMessages
+    rate_limits:
+      per_block: 1
+      per_day: 20
+
+proposal_intent:
+  require_metadata: true
+  max_validity_seconds: 86400
+  require_calldata_hash_match: true
+  require_simulation: true
+  privileged_selectors:
+    - "executePayload(uint40)"
+    - "updateExecutors((uint8,address)[])"
+    - "updateVotingConfigs((uint8,uint24,uint24,uint56,uint56,uint128)[])"
+  monitor_required_for:
+    - upgrade
+    - admin_transfer
+    - bridge_limit_change
+  proposals:
+    - id: "AAVE-V3-PAYLOAD-REPRESENTATIVE"
+      target: AavePayloadsControllerEthereum
+      category: upgrade
+      selector: "executePayload(uint40)"
+      intent: "Representative fixture for executing a queued governance payload after review and delay."
+      created_at: "2026-05-03T00:00:00Z"
+      expires_at: "2026-05-04T00:00:00Z"
+      reviewed_calldata_hash: "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      execution_calldata_hash: "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      simulation:
+        provider: local-fork
+        status: passed
+      monitor:
+        enabled: true
+        provider: protocolgate-fixture
+
+contracts:
+  - name: AaveGovernanceV3Core
+    type: governance
+    address: "0x9AEE0B04504CeF83A65AC3f0e838D0593BCb2BC7"
+    upgradeable: true
+    proxy:
+      kind: transparent
+      admin: AaveLevel2ExecutorTimelock
+    roles:
+      admin: AaveLevel2ExecutorTimelock
+      owner: AaveLevel2ExecutorTimelock
+      guardian: AaveGuardian
+    upgrade_safety:
+      storage_layout_check: true
+      initializer_locked: true
+    functions:
+      - name: updateVotingConfigs
+        category: governance
+        admin_only: true
+        timelock: AaveLevel2ExecutorTimelock
+  - name: AavePayloadsControllerEthereum
+    type: payloads-controller
+    address: "0xdAbad81aF85554E9ae636395611C58F7eC1aAEc5"
+    upgradeable: true
+    proxy:
+      kind: transparent
+      admin: AaveLevel2ExecutorTimelock
+    roles:
+      admin: AaveLevel2ExecutorTimelock
+      owner: AaveLevel2ExecutorTimelock
+      guardian: AaveGuardian
+    upgrade_safety:
+      storage_layout_check: true
+      initializer_locked: true
+    functions:
+      - name: updateExecutors
+        category: admin_transfer
+        admin_only: true
+        timelock: AaveLevel2ExecutorTimelock
+      - name: executePayload
+        category: payload_execution
+        admin_only: false
+  - name: AaveCrossChainController
+    type: bridge
+    address: "0xEd42a7D8559a463722Ca4beD50E0Cc05a386b0e1"
+    upgradeable: false
+    roles:
+      admin: AaveLevel2ExecutorTimelock
+      owner: AaveLevel2ExecutorTimelock
+    rate_limits:
+      per_block: 1
+      per_day: 20

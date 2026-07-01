@@ -1,0 +1,431 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://protocolgate.dev/schema/protocolgate.schema.json",
+  "title": "ProtocolGate Manifest",
+  "type": "object",
+  "required": ["version", "contracts"],
+  "properties": {
+    "version": {
+      "type": ["integer", "string"]
+    },
+    "project": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "category": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "deployment": {
+      "type": "object",
+      "properties": {
+        "environment": { "type": "string" },
+        "chain": { "type": "string" },
+        "chain_id": { "type": "integer" },
+        "allowed_deployers": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "multisigs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/multisig" }
+    },
+    "governors": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/governor" }
+    },
+    "timelocks": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/timelock" }
+    },
+    "guardians": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/guardian" }
+    },
+    "tokens": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/asset" }
+    },
+    "oracles": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/oracle" }
+    },
+    "predicates": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/predicate" }
+    },
+    "safety_controls": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/safetyControl" }
+    },
+    "bridges": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/bridge" }
+    },
+    "treasury": {
+      "type": "object",
+      "properties": {
+        "splits": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/treasurySplit" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "governance": {
+      "type": "object",
+      "properties": {
+        "quorum_bps": { "type": "integer", "minimum": 0 },
+        "voting_period_seconds": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+    "proposal_intent": {
+      "$ref": "#/$defs/proposalIntent"
+    },
+    "contracts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/contract" }
+    },
+    "policy": {
+      "type": "object",
+      "properties": {
+        "disable_rules": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^CG[0-9]{3}$" }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "address": {
+      "type": "string",
+      "pattern": "^0x[a-fA-F0-9]{40}$"
+    },
+    "asset": {
+      "type": "object",
+      "required": ["name", "decimals"],
+      "properties": {
+        "name": { "type": "string" },
+        "address": { "$ref": "#/$defs/address" },
+        "decimals": { "type": "integer", "minimum": 0, "maximum": 255 }
+      },
+      "additionalProperties": true
+    },
+    "bridge": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string" },
+        "rate_limits": { "$ref": "#/$defs/rateLimits" }
+      },
+      "additionalProperties": true
+    },
+    "contract": {
+      "type": "object",
+      "required": ["name", "type"],
+      "properties": {
+        "name": { "type": "string" },
+        "type": { "type": "string" },
+        "address": { "$ref": "#/$defs/address" },
+        "upgradeable": { "type": "boolean" },
+        "proxy": { "type": "object" },
+        "roles": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "upgrade_safety": { "type": "object" },
+        "rate_limits": { "$ref": "#/$defs/rateLimits" },
+        "integrations": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/integration" }
+        },
+        "functions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/function" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "function": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string" },
+        "category": { "type": "string" },
+        "admin_only": { "type": "boolean" },
+        "external_calls": { "type": "boolean" },
+        "state_updates_before_external_calls": { "type": "boolean" },
+        "controls": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "timelock": { "type": "string" },
+        "max_bps": { "type": "integer", "minimum": 0, "maximum": 10000 },
+        "supply_cap": { "type": ["integer", "string"] }
+      },
+      "additionalProperties": true
+    },
+    "guardian": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string" },
+        "multisig": { "type": "string" },
+        "timelock": { "type": "string" },
+        "powers": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "governor": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string" },
+        "address": { "$ref": "#/$defs/address" },
+        "kind": { "type": "string" },
+        "voting_delay_seconds": { "type": "integer", "minimum": 0 },
+        "voting_period_seconds": { "type": "integer", "minimum": 0 },
+        "quorum_bps": { "type": "integer", "minimum": 0 },
+        "timelock": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "integration": {
+      "type": "object",
+      "properties": {
+        "ref": { "type": "string" },
+        "name": { "type": "string" },
+        "decimals": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "expected_decimals": { "type": "integer", "minimum": 0, "maximum": 255 }
+      },
+      "additionalProperties": true
+    },
+    "multisig": {
+      "type": "object",
+      "required": ["name", "threshold", "signers"],
+      "properties": {
+        "name": { "type": "string" },
+        "address": { "$ref": "#/$defs/address" },
+        "threshold": { "type": "integer", "minimum": 1 },
+        "signers": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/address" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "oracle": {
+      "allOf": [
+        { "$ref": "#/$defs/asset" },
+        {
+          "type": "object",
+          "properties": {
+            "max_staleness_seconds": { "type": "integer", "minimum": 0 },
+            "failure_mode": { "enum": ["fail_closed", "continue"] }
+          }
+        }
+      ]
+    },
+    "proposal": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "target": { "type": "string" },
+        "category": { "type": "string" },
+        "selector": { "type": "string" },
+        "intent": { "type": "string" },
+        "created_at": { "type": "string" },
+        "expires_at": { "type": "string" },
+        "reviewed_calldata_hash": { "$ref": "#/$defs/calldataHash" },
+        "execution_calldata_hash": { "$ref": "#/$defs/calldataHash" },
+        "safe_tx_hash": { "$ref": "#/$defs/calldataHash" },
+        "proposal_hash": { "$ref": "#/$defs/calldataHash" },
+        "module": { "type": "string" },
+        "safe_module": { "type": "string" },
+        "simulation": { "$ref": "#/$defs/proposalSimulation" },
+        "monitor": { "$ref": "#/$defs/proposalMonitor" }
+      },
+      "additionalProperties": true
+    },
+    "predicate": {
+      "type": "object",
+      "required": ["name", "scope"],
+      "properties": {
+        "name": { "type": "string" },
+        "scope": {
+          "oneOf": [
+            { "type": "string" },
+            { "$ref": "#/$defs/scope" }
+          ]
+        },
+        "reads": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "authorizes": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "safetyControl": {
+      "type": "object",
+      "required": ["name", "scope", "protects"],
+      "properties": {
+        "name": { "type": "string" },
+        "contract": { "type": "string" },
+        "state_variable": { "type": "string" },
+        "scope": {
+          "oneOf": [
+            { "type": "string" },
+            { "$ref": "#/$defs/scope" }
+          ]
+        },
+        "protects": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/protectedPredicate" }
+        },
+        "bypass_selectors": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "accepted_scope_mismatch": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "protectedPredicate": {
+      "type": "object",
+      "required": ["action", "predicate"],
+      "properties": {
+        "action": { "type": "string" },
+        "predicate": { "type": "string" },
+        "expected_scope": {
+          "oneOf": [
+            { "type": "string" },
+            { "$ref": "#/$defs/scope" }
+          ]
+        },
+        "loss_surface": { "type": "string" },
+        "bypass_selectors": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "accepted_scope_mismatch": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "scope": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "type": "string" },
+        "key": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "proposalIntent": {
+      "type": "object",
+      "properties": {
+        "require_metadata": { "type": "boolean" },
+        "max_validity_seconds": { "type": "integer", "minimum": 1 },
+        "require_calldata_hash_match": { "type": "boolean" },
+        "require_simulation": { "type": "boolean" },
+        "privileged_selectors": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "allowed_safe_modules": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "safe_modules": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/safeModule" }
+        },
+        "monitor_required_for": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "proposals": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/proposal" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "proposalMonitor": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "provider": { "type": "string" },
+        "id": { "type": "string" },
+        "url": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "proposalSimulation": {
+      "type": "object",
+      "properties": {
+        "provider": { "type": "string" },
+        "status": { "enum": ["passed", "failed", "missing"] },
+        "url": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "rateLimits": {
+      "type": "object",
+      "properties": {
+        "per_block": { "type": "integer", "minimum": 1 },
+        "per_day": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": true
+    },
+    "safeModule": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "address": { "$ref": "#/$defs/address" },
+        "purpose": { "type": "string" },
+        "enabled": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "calldataHash": {
+      "type": "string",
+      "pattern": "^0x[a-fA-F0-9]{64}$"
+    },
+    "timelock": {
+      "type": "object",
+      "required": ["name", "delay_seconds"],
+      "properties": {
+        "name": { "type": "string" },
+        "address": { "$ref": "#/$defs/address" },
+        "delay_seconds": { "type": "integer", "minimum": 0 },
+        "admin": { "type": "string" },
+        "proposer": { "type": "string" },
+        "executor": { "type": "string" },
+        "controller": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "treasurySplit": {
+      "type": "object",
+      "required": ["recipient", "bps"],
+      "properties": {
+        "recipient": { "type": "string" },
+        "bps": { "type": "integer", "minimum": 0, "maximum": 10000 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

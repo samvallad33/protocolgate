@@ -1,0 +1,105 @@
+version: 1
+
+project:
+  name: AaveV37GraceBypassFixture
+  category: Control-plane invariant hunting fixture
+
+deployment:
+  environment: production
+  chain: base
+  chain_id: 8453
+  allowed_deployers:
+    - ProtocolGovernance
+
+multisigs:
+  - name: ProtocolGovernance
+    address: "0x1000000000000000000000000000000000000001"
+    threshold: 3
+    signers:
+      - "0x1000000000000000000000000000000000000011"
+      - "0x1000000000000000000000000000000000000012"
+      - "0x1000000000000000000000000000000000000013"
+      - "0x1000000000000000000000000000000000000014"
+      - "0x1000000000000000000000000000000000000015"
+
+timelocks:
+  - name: ProtocolTimelock
+    address: "0x2000000000000000000000000000000000000002"
+    delay_seconds: 172800
+    proposer: ProtocolGovernance
+    executor: ProtocolGovernance
+
+tokens:
+  - name: cbBTC
+    address: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"
+    decimals: 8
+  - name: weETH
+    address: "0x04C0599Ae5A44757c0af6F9eC3b93da8976c150A"
+    decimals: 18
+  - name: USDC
+    address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    decimals: 6
+
+oracles:
+  - name: AaveOracle
+    address: "0x2Cc0Fc26eD4563A5ce5e8bdcfe1A2878676Ae156"
+    decimals: 8
+    max_staleness_seconds: 3600
+    failure_mode: fail_closed
+
+predicates:
+  - name: healthFactorBelowOne
+    scope: account
+    reads:
+      - all_enabled_collateral
+      - all_user_debt
+    authorizes:
+      - liquidationCall
+
+safety_controls:
+  - name: LiquidationGrace
+    contract: AavePool
+    state_variable: liquidationGracePeriodUntil
+    scope:
+      kind: reserve
+      key: asset
+    protects:
+      - action: liquidationCall
+        predicate: healthFactorBelowOne
+        expected_scope: account
+        loss_surface: user_principal
+    bypass_selectors:
+      - collateralAsset
+      - debtAsset
+
+contracts:
+  - name: AavePool
+    type: lending_pool
+    address: "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5"
+    upgradeable: true
+    proxy:
+      kind: transparent
+      admin: ProtocolTimelock
+    roles:
+      admin: ProtocolTimelock
+      owner: ProtocolTimelock
+    upgrade_safety:
+      storage_layout_check: true
+      initializer_locked: true
+    integrations:
+      - ref: cbBTC
+        decimals: 8
+      - ref: weETH
+        decimals: 18
+      - ref: USDC
+        decimals: 6
+      - ref: AaveOracle
+        decimals: 8
+    functions:
+      - name: liquidationCall
+        category: liquidation
+        external_calls: true
+        state_updates_before_external_calls: true
+        controls:
+          - nonReentrant
+          - reserve_pair_grace_check

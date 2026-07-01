@@ -1,0 +1,22 @@
+name: ProtocolGate Policy Gate
+description: Validate protocolgate.yaml before smart-contract deployment.
+
+inputs:
+  manifest:
+    description: Path to protocolgate.yaml in the caller repository.
+    required: false
+    default: protocolgate.yaml
+  engine:
+    description: "Policy engine to use: builtin or opa."
+    required: false
+    default: builtin
+
+runs:
+  using: composite
+  steps:
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+    - name: Run ProtocolGate
+      shell: bash
+      run: |
+        uv run --locked --no-dev --project "$GITHUB_ACTION_PATH/.." protocolgate validate "$GITHUB_WORKSPACE/${{ inputs.manifest }}" --engine "${{ inputs.engine }}"

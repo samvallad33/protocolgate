@@ -1,0 +1,405 @@
+version: 1
+
+project:
+  name: DRE App dreUSD
+  category: Smart Contract DevSecOps - Web3 control-plane security
+
+deployment:
+  environment: production
+  chain: base
+  chain_id: 8453
+  allowed_deployers:
+    - GovernanceMultisig
+
+multisigs:
+  - name: GovernanceMultisig
+    address: "0x1000000000000000000000000000000000000001"
+    threshold: 3
+    signers:
+      - "0x1000000000000000000000000000000000000011"
+      - "0x1000000000000000000000000000000000000012"
+      - "0x1000000000000000000000000000000000000013"
+      - "0x1000000000000000000000000000000000000014"
+      - "0x1000000000000000000000000000000000000015"
+  - name: PauserMultisig
+    address: "0x2000000000000000000000000000000000000002"
+    threshold: 2
+    signers:
+      - "0x2000000000000000000000000000000000000011"
+      - "0x2000000000000000000000000000000000000012"
+      - "0x2000000000000000000000000000000000000013"
+  - name: GuardianMultisig
+    address: "0x3000000000000000000000000000000000000003"
+    threshold: 2
+    signers:
+      - "0x3000000000000000000000000000000000000011"
+      - "0x3000000000000000000000000000000000000012"
+      - "0x3000000000000000000000000000000000000013"
+  - name: TreasuryMultisig
+    address: "0x4000000000000000000000000000000000000004"
+    threshold: 3
+    signers:
+      - "0x4000000000000000000000000000000000000011"
+      - "0x4000000000000000000000000000000000000012"
+      - "0x4000000000000000000000000000000000000013"
+      - "0x4000000000000000000000000000000000000014"
+      - "0x4000000000000000000000000000000000000015"
+
+timelocks:
+  - name: GovernanceTimelock
+    address: "0x5000000000000000000000000000000000000005"
+    delay_seconds: 172800
+    proposer: GovernanceMultisig
+    executor: GovernanceMultisig
+
+guardians:
+  - name: PauseGuardian
+    multisig: PauserMultisig
+    powers:
+      - pause
+  - name: ComplianceGuardian
+    multisig: GuardianMultisig
+    powers:
+      - freeze
+      - unfreeze
+
+tokens:
+  - name: USDC
+    address: "0x833589fcd6edb6e08f4c7c32d4f71b54bdabd2e1"
+    decimals: 6
+  - name: dreUSD
+    decimals: 18
+  - name: dreUSDs
+    decimals: 18
+
+oracles:
+  - name: ChainlinkUSDCUSD
+    decimals: 8
+    max_staleness_seconds: 3600
+    failure_mode: fail_closed
+
+bridges:
+  - name: dreUSDLayerZeroOFT
+    rate_limits:
+      per_block: 1
+      per_day: 100000000
+  - name: dreShareLayerZeroOFT
+    rate_limits:
+      per_block: 1
+      per_day: 100000000
+
+proposal_intent:
+  require_metadata: true
+  max_validity_seconds: 86400
+  require_calldata_hash_match: true
+  require_simulation: true
+  proposals:
+    # SYNTHETIC DEMO PROPOSAL - not a real DRE governance action.
+    # Models the classic key-compromise play: a "routine" mint-cap increase
+    # where the execution calldata does not match what signers reviewed,
+    # with no simulation evidence and no monitor coverage.
+    # Deterministically rejected by CG034 + CG037 + CG038.
+    - id: PG-DEMO-MINTCAP-001
+      target: dreUSDManager
+      category: mint_cap_change
+      selector: "setDailyFiatMintCap(uint256)"
+      intent: "Raise daily fiat mint cap from 100,000,000 to 120,000,000 for Q3 custodian inflows"
+      created_at: "2026-06-12T09:00:00Z"
+      expires_at: "2026-06-13T09:00:00Z"
+      reviewed_calldata_hash: "0x3f8e2a1b9c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f"
+      execution_calldata_hash: "0xd41d8cd98f00b204e9800998ecf8427ed41d8cd98f00b204e9800998ecf8427e"
+  privileged_selectors:
+    - "upgradeToAndCall(address,bytes)"
+    - "grantRole(bytes32,address)"
+    - "revokeRole(bytes32,address)"
+    - "setOracle(address,address,uint256)"
+    - "setStalenessThreshold(address,uint256)"
+    - "setDeviationThreshold(address,uint256)"
+    - "setSequencerUptimeFeed(address)"
+    - "setGracePeriod(uint256)"
+    - "setDailyFiatMintCap(uint256)"
+    - "updateExpressWithdrawal(uint256,uint256,address)"
+    - "updateWithdrawal(uint256)"
+    - "updateVault(address)"
+    - "updateCustodianList(address,bool)"
+    - "updateAllowedList(address,bool)"
+    - "updateVaultAdapter(address)"
+    - "setPeer(uint32,bytes32)"
+    - "setDelegate(address)"
+  monitor_required_for:
+    - upgrade
+    - oracle_change
+    - bridge_limit_change
+    - mint_cap_change
+    - withdrawal_limit_change
+
+policy:
+  disable_rules:
+    # DRE has user redemption functions, queue fill functions, and withdrawal
+    # configuration functions. Keep CG004 as a manual source-review check until
+    # the manifest is refined from the contest repo instead of public metadata.
+    - CG004
+
+contracts:
+  - name: dreUSD
+    type: token
+    upgradeable: true
+    proxy:
+      kind: uups
+      admin: GovernanceTimelock
+    roles:
+      admin: GovernanceTimelock
+      owner: GovernanceTimelock
+      pauser: PauserMultisig
+      guardian: GuardianMultisig
+      manager: "0x6000000000000000000000000000000000000006"
+    upgrade_safety:
+      storage_layout_check: true
+      initializer_locked: true
+    functions:
+      - name: unpause
+        admin_only: true
+        timelock: GovernanceTimelock
+      - name: setSanctionsList
+        admin_only: true
+        timelock: GovernanceTimelock
+
+  - name: dreUSDManager
+    type: stablecoin-manager
+    upgradeable: true
+    proxy:
+      kind: uups
+      admin: GovernanceTimelock
+    roles:
+      admin: GovernanceTimelock
+      owner: GovernanceTimelock
+      pauser: PauserMultisig
+      moderator: GovernanceTimelock
+      treasury: TreasuryMultisig
+      withdrawal_config: GovernanceTimelock
+    upgrade_safety:
+      storage_layout_check: true
+      initializer_locked: true
+    integrations:
+      - ref: USDC
+        decimals: 6
+      - ref: ChainlinkUSDCUSD
+        decimals: 8
+    functions:
+      - name: requestWithdrawal
+        category: redemption
+        external_calls: true
+        state_updates_before_external_calls: true
+        controls:
+          - cooldown
+          - circuit_breaker
+          - pause
+          - nonReentrant
+      - name: requestExpressWithdrawal
+        category: redemption
+        external_calls: true
+        state_updates_before_external_calls: true
+        controls:
+          - cooldown
+          - circuit_breaker
+          - pause
+          - nonReentrant
+      - name: fillWithdrawal
+        external_calls: true
+        state_updates_before_external_calls: true
+        controls:
+          - nonReentrant
+      - name: fillExpressWithdrawals
+        external_calls: true
+        state_updates_before_external_calls: true
+        controls:
+          - nonReentrant
+      - name: unpause
+        admin_only: true
+        timelock: GovernanceTimelock
+      - name: setDailyFiatMintCap
+        category: supply
+        admin_only: true
+        timelock: GovernanceTimelock
+        supply_cap: "10000000000"
+      - name: updateExpressWithdrawal
+        category: fee
+        admin_only: true
+        timelock: GovernanceTimelock
+        max_bps: 500
+      - name: updateWithdrawal
+        admin_only: true
+        timelock: GovernanceTimelock
+      - name: updateVault
+        admin_only: true
+        timelock: GovernanceTimelock
+      - name: updateCustodianList
+        admin_only: true
+        timelock: GovernanceTimelock
+      - name: updateAllowedList
+        admin_only: true
+        timelock: GovernanceTimelock
+      - name: updateVaultAdapter
+        admin_only: true
+        timelock: GovernanceTimelock
+
+  - name: dreUSDOracle
+    type: oracle
+    upgradeable: true
+    proxy:
+      kind: uups
+      admin: GovernanceTimelock
+    roles:
+      admin: GovernanceTimelock
+      owner: GovernanceTimelock
+      moderator: GovernanceTimelock
+    upgrade_safety:
+      storage_layout_check: true
+      initializer_locked: true
+    functions:
+      - name: setOracle
+        admin_only: true
+        timelock: GovernanceTimelock
+      - name: setStalenessThreshold
+        admin_only: true
+        timelock: GovernanceTimelock
+      - name: setDeviationThreshold
+        admin_only: true
+        timelock: GovernanceTimelock
+      - name: setSequencerUptimeFeed
+        admin_only: true
+        timelock: GovernanceTimelock
+      - name: setGracePeriod
+        admin_only: true
+        timelock: GovernanceTimelock
+
+  - name: dreUSDs
+    type: vault
+    upgradeable: true
+    proxy:
+      kind: uups
+      admin: GovernanceTimelock
+    roles:
+      admin: GovernanceTimelock
+      owner: GovernanceTimelock
+      pauser: PauserMultisig
+    upgrade_safety:
+      storage_layout_check: true
+      initializer_locked: true
+    integrations:
+      - ref: dreUSD
+        decimals: 18
+    functions:
+      - name: redeem
+        category: redemption
+        external_calls: true
+        state_updates_before_external_calls: true
+        controls:
+          - cooldown
+          - circuit_breaker
+          - pause
+          - nonReentrant
+      - name: withdraw
+        category: redemption
+        external_calls: true
+        state_updates_before_external_calls: true
+        controls:
+          - cooldown
+          - circuit_breaker
+          - pause
+          - nonReentrant
+      - name: unpause
+        admin_only: true
+        timelock: GovernanceTimelock
+
+  - name: dreRewardsDistributor
+    type: rewards
+    upgradeable: true
+    proxy:
+      kind: uups
+      admin: GovernanceTimelock
+    roles:
+      admin: GovernanceTimelock
+      owner: GovernanceTimelock
+      pauser: PauserMultisig
+      moderator: GovernanceTimelock
+    upgrade_safety:
+      storage_layout_check: true
+      initializer_locked: true
+    functions:
+      - name: addRewards
+        admin_only: true
+        timelock: GovernanceTimelock
+      - name: claimVested
+        external_calls: true
+        state_updates_before_external_calls: true
+        controls:
+          - nonReentrant
+      - name: unpause
+        admin_only: true
+        timelock: GovernanceTimelock
+
+  - name: dreWithdrawalNFT
+    type: withdrawal-nft
+    upgradeable: true
+    proxy:
+      kind: uups
+      admin: GovernanceTimelock
+    roles:
+      admin: GovernanceTimelock
+      owner: GovernanceTimelock
+      minter: "0x6000000000000000000000000000000000000006"
+      burner: "0x6000000000000000000000000000000000000006"
+    upgrade_safety:
+      storage_layout_check: true
+      initializer_locked: true
+
+  - name: dreOVaultComposer
+    type: bridge
+    upgradeable: true
+    proxy:
+      kind: uups
+      admin: GovernanceTimelock
+    roles:
+      admin: GovernanceTimelock
+      owner: GovernanceTimelock
+      pauser: PauserMultisig
+    rate_limits:
+      per_block: 1
+      per_day: 100000000
+    upgrade_safety:
+      storage_layout_check: true
+      initializer_locked: true
+
+  - name: dreShareOFT
+    type: bridge
+    upgradeable: true
+    proxy:
+      kind: uups
+      admin: GovernanceTimelock
+    roles:
+      admin: GovernanceTimelock
+      owner: GovernanceTimelock
+      guardian: GuardianMultisig
+    rate_limits:
+      per_block: 1
+      per_day: 100000000
+    upgrade_safety:
+      storage_layout_check: true
+      initializer_locked: true
+
+  - name: dreShareOFTAdapter
+    type: bridge
+    upgradeable: true
+    proxy:
+      kind: uups
+      admin: GovernanceTimelock
+    roles:
+      admin: GovernanceTimelock
+      owner: GovernanceTimelock
+    rate_limits:
+      per_block: 1
+      per_day: 100000000
+    upgrade_safety:
+      storage_layout_check: true
+      initializer_locked: true

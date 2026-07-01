@@ -1,0 +1,50 @@
+version: 1
+
+project:
+  name: ProposalIntentReference
+  category: Web3 control-plane proposal safety
+
+contracts: []
+
+proposal_intent:
+  require_metadata: true
+  max_validity_seconds: 86400
+  require_calldata_hash_match: true
+  require_simulation: true
+  privileged_selectors:
+    - "upgradeTo(address)"
+    - "upgradeToAndCall(address,bytes)"
+    - "changeAdmin(address)"
+    - "setOracle(address)"
+    - "setBridgeLimit(uint256)"
+    - "mint(address,uint256)"
+    - "setWithdrawalLimit(uint256)"
+  allowed_safe_modules:
+    - DelayModule
+    - RolesModule
+  safe_modules:
+    - name: DelayModule
+      address: "0x6000000000000000000000000000000000000006"
+      purpose: "Require delayed execution for privileged Safe transactions."
+  monitor_required_for:
+    - upgrade
+    - oracle_change
+    - bridge_limit_change
+    - mint_cap_change
+    - withdrawal_limit_change
+  proposals:
+    - id: "PG-001"
+      target: MonetrixVault
+      category: upgrade
+      selector: "upgradeTo(address)"
+      intent: "Upgrade MonetrixVault to audited implementation v1.2.0."
+      created_at: "2026-05-03T00:00:00Z"
+      expires_at: "2026-05-04T00:00:00Z"
+      reviewed_calldata_hash: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      execution_calldata_hash: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      simulation:
+        provider: tenderly
+        status: passed
+      monitor:
+        enabled: true
+        provider: defender

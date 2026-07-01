@@ -1,0 +1,134 @@
+version: 1
+
+project:
+  name: Compound III Comet USDC Mainnet
+  category: Public Web3 control-plane fixture
+  source_repo: compound-finance/comet
+  source_commit: ed6ebcd
+  scope_note: "Modeled case-study manifest from public repo deployment files; not a live-state assertion or exhaustive audit."
+
+deployment:
+  environment: production
+  chain: ethereum-mainnet
+  chain_id: 1
+  allowed_deployers:
+    - CompoundTimelock
+
+governors:
+  - name: CompoundGovernorBravo
+    address: "0xc0da02939e1441f497fd74f78ce7decb17b66529"
+    kind: governor-bravo
+    voting_delay_seconds: 172800
+    voting_period_seconds: 259200
+    timelock: CompoundTimelock
+
+timelocks:
+  - name: CompoundTimelock
+    address: "0x6d903f6003cca6255d85cca4d3b5e5146dc33925"
+    delay_seconds: 172800
+    proposer: CompoundGovernorBravo
+    executor: CompoundGovernorBravo
+
+guardians:
+  - name: CompoundPauseGuardian
+    address: "0xbbf3f1421d886e9b2c5d716b5192ac998af2012c"
+    powers: []
+
+tokens:
+  - name: USDC
+    address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+    decimals: 6
+  - name: WETH
+    address: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+    decimals: 18
+
+oracles:
+  - name: ChainlinkUSDCUSD
+    address: "0x8fFfFfd4AfB6115b954Bd326cbe7B4BA576818f6"
+    decimals: 8
+    max_staleness_seconds: 3600
+    failure_mode: fail_closed
+  - name: ChainlinkETHUSD
+    address: "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419"
+    decimals: 8
+    max_staleness_seconds: 3600
+    failure_mode: fail_closed
+
+proposal_intent:
+  require_metadata: true
+  max_validity_seconds: 86400
+  require_calldata_hash_match: true
+  require_simulation: true
+  privileged_selectors:
+    - "deployAndUpgradeTo(address,address)"
+    - "updateAssetSupplyCap(address,address,uint128)"
+    - "setBaseTokenPriceFeed(address,address)"
+  monitor_required_for:
+    - upgrade
+    - oracle_change
+    - mint_cap_change
+  proposals:
+    - id: "COMET-USDC-UPGRADE-REPRESENTATIVE"
+      target: CompoundUSDCComet
+      category: upgrade
+      selector: "deployAndUpgradeTo(address,address)"
+      intent: "Representative fixture for a Comet implementation upgrade routed through governance/timelock."
+      created_at: "2026-05-03T00:00:00Z"
+      expires_at: "2026-05-04T00:00:00Z"
+      reviewed_calldata_hash: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      execution_calldata_hash: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      simulation:
+        provider: local-fork
+        status: passed
+      monitor:
+        enabled: true
+        provider: protocolgate-fixture
+
+contracts:
+  - name: CompoundUSDCComet
+    type: comet-market
+    address: "0xc3d688B66703497DAA19211EEdff47f25384cdc3"
+    upgradeable: true
+    proxy:
+      kind: transparent
+      admin: CompoundTimelock
+    roles:
+      admin: CompoundTimelock
+      owner: CompoundTimelock
+      pauser: CompoundPauseGuardian
+    upgrade_safety:
+      storage_layout_check: true
+      initializer_locked: true
+    integrations:
+      - ref: USDC
+        decimals: 6
+      - ref: ChainlinkUSDCUSD
+        decimals: 8
+      - ref: ChainlinkETHUSD
+        decimals: 8
+    functions:
+      - name: deployAndUpgradeTo
+        category: upgrade
+        admin_only: true
+        timelock: CompoundTimelock
+      - name: updateAssetSupplyCap
+        category: supply
+        admin_only: true
+        timelock: CompoundTimelock
+        supply_cap: "1000000000000000000000000"
+      - name: setBaseTokenPriceFeed
+        category: oracle_change
+        admin_only: true
+        timelock: CompoundTimelock
+  - name: CompoundUSDCConfigurator
+    type: configurator
+    address: "0x316f9708bB98af7dA9c68C1C3b5e79039cD336E3"
+    upgradeable: false
+    roles:
+      admin: CompoundTimelock
+      owner: CompoundTimelock
+    functions:
+      - name: transferGovernor
+        category: admin_transfer
+        admin_only: true
+        timelock: CompoundTimelock

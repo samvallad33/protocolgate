@@ -1,19 +1,21 @@
 # ProtocolGate
 
-**Audits check the code. ProtocolGate checks the control plane around the code.**
-
 [![CI](https://github.com/samvallad33/protocolgate/actions/workflows/protocolgate.yml/badge.svg)](https://github.com/samvallad33/protocolgate/actions/workflows/protocolgate.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Status: Alpha 0.1.0](https://img.shields.io/badge/status-alpha%200.1.0-orange.svg)](#status)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](#install)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
 
-The $1.5B Bybit hack wasn't a Solidity bug. The contracts were fine. The *signing flow* was compromised — approvers blind-signed a delegatecall that swapped the proxy out from under them. No audit catches that, because the code was never the problem.
+**Audits check the code. ProtocolGate checks the control plane around the code.**
 
-ProtocolGate is a CLI + GitHub Action that gates the setup *around* your contracts: who admins the proxy, whether upgrades sit behind a timelock, whether your multisig is real or paper, and — most importantly — whether the calldata your signers approved is the calldata that actually executes. You declare your deployment topology in one file. The engine runs 34 rules against it. If anything fails, the build fails and the deploy is blocked.
+The $1.5B Bybit exploit was not a Solidity bug. The contracts functioned perfectly. The critical failure occurred within the signing flow: approvers blind-signed a `delegatecall` transaction that swapped the underlying proxy implementation out from under them. Traditional smart contract audits fail to catch these vectors because the on-chain code itself is not the source of the vulnerability.
 
-> **Status:** Alpha (0.1.0). Not on PyPI yet — install from source with `uv`.
+ProtocolGate is a lightweight CLI and GitHub Action designed to gate the entire operational setup surrounding your smart contracts. It enforces strict policies regarding proxy administration, timelock constraints, multisig thresholds, and critical execution calldata verification.
 
-## Install
+By declaring your deployment topology in a single declarative file, the static engine evaluates your architecture against 34 deterministic security policies before production deployment. If any security invariant is violated, the build fails and the deployment pipeline is immediately blocked.
+
+> <a name="status"></a>**Status:** Alpha (0.1.0). Building directly from source via `uv` is required while packages are finalized.
+
+## Installation
 
 ```bash
 git clone https://github.com/samvallad33/protocolgate
@@ -21,44 +23,48 @@ cd protocolgate
 uv run protocolgate --help
 ```
 
-Every command runs through `uv run protocolgate <cmd>`. Python 3.11+.
+Requires Python 3.11 or higher. All terminal commands execute via the `uv` runner.
 
-## The one rule that maps to Bybit: CG034
+## Core Mitigation: Rule CG034 (The Bybit Fix)
 
-The Bybit failure class is *signers approving one payload while a different one executes*. CG034 is the rule aimed at it. In your manifest you declare two hashes — the calldata your signers reviewed (`reviewed_calldata_hash`) and the calldata slated to execute (`execution_calldata_hash`). **CG034 fails `critical` if either is missing, malformed, or unequal**, turning "we're pretty sure it's the same transaction" into an assertion CI enforces.
+The blind-signing vector involves signers reviewing and approving a specific payload while a mutated transaction executes on-chain. Rule CG034 targets this attack surface directly.
 
-Honest limit: ProtocolGate doesn't compute these hashes from real calldata — *you* supply them, so source the execution hash independently for the check to mean anything. That's the point of CG034: make the match a reviewable, build-blocking claim instead of a hope. It's the single most unique thing this tool does.
+In your topology manifest, you declare two distinct cryptographic markers: the `reviewed_calldata_hash` and the `execution_calldata_hash`. The CG034 policy triggers a critical build failure if either hash is missing, structurally malformed, or if they do not match identically. This transforms loose operational assumptions into a strict assertion enforced directly by your deployment pipeline.
+
+**Operational boundary.** ProtocolGate does not dynamically compute these hashes from live runtime calldata. You supply these inputs within the manifest. To maximize the utility of CG034, you must source the execution hash independently from your signing environment. This design choice forces the transactional match to become a transparent, build-blocking assertion instead of an operational hope.
 
 ## Quickstart
 
 ```bash
-# Validate a manifest — exits non-zero if any rule fails
+# Validate a local manifest configuration (exits non-zero on policy failure)
 uv run protocolgate validate protocolgate.yaml
 
-# Try it on the bundled examples
-uv run protocolgate validate examples/protocolgate.valid.yaml     # passes
-uv run protocolgate validate examples/protocolgate.invalid.yaml   # fails, shows findings
+# Evaluate bundled test configurations
+uv run protocolgate validate examples/protocolgate.valid.yaml     # pass
+uv run protocolgate validate examples/protocolgate.invalid.yaml   # fail (returns structural findings)
 
-# Compare a live snapshot against your manifest (drift detection)
+# Compare a live network snapshot against your manifest for drift detection
 uv run protocolgate drift protocolgate.yaml live-state.json
 ```
 
-Output as `table` (default), `json`, or `markdown`.
+Output formatting is available as standard stdout tables (default), raw JSON, or Markdown via `--output`.
 
-## The one file
+## The Topology Manifest File
 
-You describe your deployment — proxies, admins, timelocks, multisigs, oracles, bridges, treasury — in `protocolgate.yaml`. That's the whole interface. The engine reads it, runs the rules deterministically, and prints what's wrong and how to fix it. Findings carry a rule ID (`CGxxx`), a severity, the failing path, and remediation.
+Your entire deployment infrastructure topology is described inside a single `protocolgate.yaml` configuration file. This manifest maps the intended relationships between proxies, administrators, timelocks, multisigs, oracles, cross-chain bridges, and treasuries.
 
-Real manifests to copy from:
+The engine processes this file, runs the rules deterministically, and isolates errors. Every generated finding returns an explicit rule identifier (`CGxxx`), an assigned severity tier, the specific failing configuration path, and exact remediation instructions.
 
-- [`examples/protocolgate.valid.yaml`](examples/protocolgate.valid.yaml) — a clean setup
-- [`examples/protocolgate.invalid.yaml`](examples/protocolgate.invalid.yaml) — deliberately broken
-- [`examples/protocolgate.proposal-intent.yaml`](examples/protocolgate.proposal-intent.yaml) — the CG034 calldata gate
-- [`examples/public/`](examples/public/) — real protocols: Aave Governance v3, Compound Comet USDC, Lido Core, DRE Labs dreUSD
+Reference configurations available in the repository:
 
-## In CI
+- [`examples/protocolgate.valid.yaml`](examples/protocolgate.valid.yaml) — production-grade reference setup
+- [`examples/protocolgate.invalid.yaml`](examples/protocolgate.invalid.yaml) — deliberately broken configuration showcasing error findings
+- [`examples/protocolgate.proposal-intent.yaml`](examples/protocolgate.proposal-intent.yaml) — configuration for the CG034 calldata gate
+- [`examples/public/`](examples/public/) — manifests modeled from live Web3 protocols: Aave Governance v3, Compound Comet USDC, Lido Core, and DRE Labs dreUSD
 
-Drop this in a workflow to block any deploy PR that fails a rule:
+## Continuous Integration (CI/CD)
+
+Drop ProtocolGate directly into your existing deployment workflows to block insecure pull requests before they merge:
 
 ```yaml
 - uses: actions/checkout@v4
@@ -67,44 +73,44 @@ Drop this in a workflow to block any deploy PR that fails a rule:
     manifest: protocolgate.yaml
 ```
 
-Non-zero exit → red check → merge blocked. No servers, no accounts, no API keys.
+A non-zero exit code stops the pipeline, applies a red check to the pull request, and blocks deployment. This execution model runs entirely locally in the runner environment: no external servers, no cloud accounts, and no third-party API keys.
 
-## What it checks
+## Policy Coverage
 
-The 34 rules (`CG001`–`CG026`, `CG032`–`CG039`) cover:
+The 34 built-in rules (`CG001` through `CG026`, and `CG032` through `CG039`) evaluate the following infrastructure vectors:
 
-| Area | Example checks |
-|------|----------------|
-| **Admin control** | Proxy admin isn't an EOA; upgrade power sits behind a timelock |
-| **Multisig** | No paper (1-of-N) multisigs |
-| **Timelocks** | Delays enforced on admin, unpause, supply, and fee changes |
-| **Oracles** | Staleness bounds are set |
-| **Bridges** | Rate limits are declared |
-| **Treasury** | Splits sum correctly |
-| **Chain** | Chain ID is pinned |
-| **Signing (CG034)** | Reviewed vs. executed calldata hashes (declared) match; selector + Safe-module allowlists |
-| **Drift** | A live JSON snapshot matches the manifest you shipped |
+| Security Focus Area | Evaluated Invariants and Policy Checks |
+| --- | --- |
+| **Admin Control** | Ensures proxy admins are smart contracts rather than EOAs; verifies upgrade authority is isolated behind a timelock contract. |
+| **Multisig Hygiene** | Flags paper configurations, such as low-threshold 1-of-N signing requirements. |
+| **Timelock Enforcement** | Enforces minimum delays on critical administration, unpause functions, supply-cap updates, and fee changes. |
+| **Oracle Soundness** | Validates that acceptable data-staleness bounds are explicitly declared. |
+| **Bridge Security** | Ensures strict volume rate limits are defined across cross-chain parameters. |
+| **Treasury Integrity** | Verifies that financial distribution splits sum precisely to target allocations. |
+| **Chain Alignment** | Confirms target EVM chain IDs are pinned explicitly to prevent replay vectors. |
+| **Intent Signing (CG034)** | Asserts that reviewed and executed calldata hashes match identically; runs strict selector and Safe-module allowlists. |
+| **Drift Detection** | Compares live network-state JSON snapshots against the manifest shipped in code. |
 
-Full list: [`policies/catalog.md`](policies/catalog.md).
+The exhaustive ruleset is maintained inside [`policies/catalog.md`](policies/catalog.md).
 
-## What it isn't
+## Architecture Boundaries
 
-ProtocolGate earns trust by being honest about its edges:
+ProtocolGate maintains clear, transparent boundaries regarding its position in the security lifecycle:
 
-- It checks the topology **you declare**. It's only as good as your manifest — lie in the file, pass the gate.
-- CG034's hashes are inputs you provide, not values ProtocolGate computes from real calldata — it checks they're present, well-formed, and equal, not that either reflects the actual transaction.
-- It does **not** replace audits, fuzzing, or runtime monitoring. It's a different layer.
-- It does **not** (yet) query live RPC, fetch Safe transactions, or run simulations for you. You feed it the facts.
-- The rule engine is the only decision-maker. No LLM, no heuristics, no network calls.
+- **Manifest dependency.** The engine evaluates the topology you declare in code. If a manifest contains falsified configuration variables, the engine processes those variables as ground truth.
+- **Input-driven hashing.** The CG034 rule verifies that the provided input hashes are present, well-formed, and equal. It does not independently compute hashes from active mempools or signature payloads.
+- **Complements the stack.** This tool is an independent infrastructure layer. It runs alongside code audits, fuzzing frameworks, and runtime monitoring solutions — it does not replace them.
+- **Static execution engine.** The core CLI does not query live RPC nodes, fetch real-time Safe transactions, or simulate transactions out of the box. It evaluates the facts you pass directly to it.
+- **Pure determinism.** The ruleset is built on boolean logic. The engine contains no probabilistic machine-learning models, no flaky heuristics, and makes zero network calls during evaluation.
 
-## Docs
+## Extended Documentation
 
-- [Proposal Intent Gate (CG034)](docs/PROPOSAL_INTENT_GATE.md) — the calldata-match deep dive
-- [Invariant Hunter](docs/INVARIANT_HUNTER.md) — the `CG039` hunt rule
-- [Policy catalog](policies/catalog.md) — every rule, severity, and remediation
+- [Proposal Intent Gate (CG034)](docs/PROPOSAL_INTENT_GATE.md) — detailed engineering deep dive into the calldata-matching system
+- [Invariant Hunter](docs/INVARIANT_HUNTER.md) — guide for the CG039 hunt rule
+- [Policy Catalog](policies/catalog.md) — index of every rule, severity mapping, and remediation step
 
-Optional: pairing with [Vestige](https://github.com/samvallad33/vestige) (AGPL-3.0) adds cross-engagement memory. It's entirely optional — ProtocolGate has no dependency on it.
+*Optional integration:* Pairing this repository with [Vestige](https://github.com/samvallad33/vestige) (AGPL-3.0) introduces shared cross-engagement memory. This is completely decoupled — ProtocolGate functions natively without external dependencies.
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Licensed under the Apache-2.0 License. See [LICENSE](LICENSE) for details.
